@@ -1,4 +1,4 @@
-# docs — 생성형 AI Dynamic DLP Gateway 공식 문서
+# [SSOT] Dynamic DLP Gateway — Specification & Implementation Index
 
 설계·계약·기능 스펙 문서 모음. 이 README는 **어디에 무엇이 있는지 알려주는 지도**다.
 
