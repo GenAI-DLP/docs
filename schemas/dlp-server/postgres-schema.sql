@@ -9,8 +9,9 @@
 --   볼트(자체 TTL)   : token_vault  ← sessions 와 수명 분리
 --   감사(장기 보존)   : log_events, token_vault_access_log  ← 운영 테이블로의 FK 없음
 --
--- 데모 구현은 인메모리/SQLite로 시작하되, 컬럼·제약·인덱스의 의미는 이 파일을 따른다.
--- 각 테이블의 설계 근거는 같은 폴더의 *.md 문서를 참조.
+-- 볼트(token_vault*)·정책(policy_*)·감사(log_events)는 데모부터 PostgreSQL로 이 스키마를 그대로 쓴다.
+-- 세션(운영: sessions*)은 미정 — 인메모리(TTL 스윕) 또는 PostgreSQL. 어느 쪽이든 컬럼·제약·인덱스의
+-- 의미는 이 파일을 따른다. 각 테이블의 설계 근거는 같은 폴더의 *.md 문서를 참조.
 -- =====================================================================
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- gen_random_uuid()
@@ -42,7 +43,8 @@ INSERT INTO entity_type_ref (code, tier) VALUES
     ('RRN','critical'), ('FOREIGN_RRN','critical'), ('CARD','critical'),
     ('ACCOUNT','high'), ('PASSPORT','high'), ('DRIVER','high'), ('CREDIT_INFO','high'),
     ('PHONE','medium'), ('EMAIL','medium'), ('BIZNO','medium'), ('AMOUNT','medium'),
-    ('NAME','low');
+    ('NAME','low'),
+    ('UNKNOWN','low');
 
 CREATE TABLE purpose_ref (
     code TEXT PRIMARY KEY,

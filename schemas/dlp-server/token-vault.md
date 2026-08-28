@@ -67,5 +67,11 @@ DDL 원본: [`postgres-schema.sql`](postgres-schema.sql) §2
 
 ## 데모 구현
 
-`transform/vault.py` 의 인메모리 딕셔너리. `tokenize(session_id, type, value)` = 해시 기반 결정론적.
-`access_scope` 게이팅과 `denied_reason` 기록은 동일하게 유지.
+`transform/vault.py` 가 이 스키마의 `token_vault` / `token_vault_access_log` 에 PostgreSQL로 직접
+읽고 쓴다. `tokenize(session_id, type, value)` 는 해시 기반 결정론적이며, 같은 세션의 같은 값
+재사용은 `UNIQUE (session_id, value_hash) WHERE revoked_at IS NULL` 로 강제한다.
+`cipher_value` 는 dlp-server가 INSERT 전 앱레벨 AES-GCM으로 암호화한 값이고(키는 설정에만,
+DB는 암호문만 본다), 복원은 `detokenize` 가 복호한다. `access_scope` 게이팅과 `denied_reason`
+기록은 스키마 그대로 유지하며, 복원 시도(성공·실패)는 매번 `token_vault_access_log` 에 INSERT
+한다. 수명·정합 규칙은 위 "수명 주기"·"인덱스" 절을 따른다. 세션 스토어(인메모리/PostgreSQL)는
+미정이나 볼트와 FK가 없어 무관하다. KMS 연동·FPE는 이후 확장이다.

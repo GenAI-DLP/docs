@@ -200,7 +200,7 @@ dlp-server/
 │   │   └── sequence_analyzer.py  # tool call 시퀀스 이상행동 탐지 (스켈레톤)
 │   │
 │   └── logging/
-│       └── events.py             # 구조화 감사 로그 — 모든 스테이지 판정이 수렴. JSONL + SQLite sink
+│       └── events.py             # 구조화 감사 로그 — 모든 스테이지 판정이 수렴. PostgreSQL log_events sink
 │
 ├── eval/
 │   ├── run_eval.py               # baseline(정규식 즉시 차단) vs full(전체 파이프라인) 비교
@@ -428,9 +428,17 @@ risk_overrides:
 
 ### 7.3 구현 단계별 저장소
 
-1차 구현은 세션 스토어를 인메모리(TTL 스윕), 볼트를 인메모리 딕셔너리, 감사 로그를 JSONL + SQLite로
-시작한다. 네 개 데이터 계약의 단일 기준은 [`../schemas/dlp-server/postgres-schema.sql`](../schemas/dlp-server/postgres-schema.sql)
-이며(계약별 설명은 [`../schemas/`](../schemas/) 하위 문서), 프로덕션 및 여유 시점의 목표다.
+1차 구현부터 **볼트(`token_vault`) · 정책(`policy_*`) · 감사(`log_events`,
+`token_vault_access_log`)는 PostgreSQL** 로 둔다(`postgres-schema.sql` 그대로).
+볼트의 `cipher_value` 는 앱레벨 AES-GCM으로 암호화하며, 키는 dlp-server 설정(env)에 두고
+저장소에는 두지 않는다. KMS 연동은 이후 확장이다.
+
+**세션 스토어(운영 3테이블)는 미정** — 인메모리(TTL 스윕) 또는 PostgreSQL(`sessions` /
+`session_entities`). `context/store.py` 의 `SessionStore` 인터페이스 뒤에 두고 멀티턴(e) 착수
+시점에 확정한다. 어느 쪽이든 볼트·감사는 세션과 FK가 없어 영향받지 않는다.
+
+네 개 데이터 계약의 단일 기준은 [`../schemas/dlp-server/postgres-schema.sql`](../schemas/dlp-server/postgres-schema.sql)
+이며(계약별 설명은 [`../schemas/`](../schemas/) 하위 문서).
 
 ---
 
@@ -438,11 +446,11 @@ risk_overrides:
 
 | 영역 | 데모 범위 (현재 구현) | 프로덕션 확장 방향 |
 |---|---|---|
-| 세션 스토어 | 인메모리 (TTL 스윕) | 외부 인메모리 스토어(Redis 등) |
-| 토큰 볼트 | 인메모리 딕셔너리 / SQLite | PostgreSQL + 앱레벨 암호화(KMS 키), 접근 범위 강제 |
+| 세션 스토어 | 인메모리(TTL 스윕) 또는 PostgreSQL — **미정** | 외부 인메모리 스토어(Redis 등) |
+| 토큰 볼트 | PostgreSQL(`token_vault`) + 앱레벨 AES-GCM + 접근 범위 게이팅 | KMS 키 연동, 형식 보존 암호화(FPE) 병행 |
 | 토큰화 방식 | 결정론적 플레이스홀더 `<PII:TYPE:n>` | 형식 보존 암호화(FPE) 병행 |
-| 정책 엔진 | 자체 YAML + 경량 룰 평가기 | 외부 정책 엔진(OPA/Rego), 관리자 API CRUD |
-| 감사 로그 | JSONL + SQLite | append-only PostgreSQL 파티셔닝 / 검색엔진 |
+| 정책 엔진 | PostgreSQL(`policy_*`) + 경량 룰 평가기 (시드 `policy.yaml`) | 외부 정책 엔진(OPA/Rego), 관리자 API CRUD |
+| 감사 로그 | PostgreSQL(`log_events`, `token_vault_access_log`) | append-only 파티셔닝 / 검색엔진 이관 |
 | 비동기 보강 | 프로세스 내 asyncio | 백그라운드 큐(Celery/RQ) |
 | NER 서빙 | CPU 추론 | 추론 런타임 최적화(ONNX 등) |
 | 프록시 연동 | gRPC unary + 전체 버퍼링 | 양방향 스트리밍 청크 단위 검사 |
@@ -461,8 +469,9 @@ risk_overrides:
 **검증:** 프록시가 붙어 `allow` 판정을 수신 → 관통 확인.
 
 ### Phase 1 — 탐지 + 토큰화 (입력 경로 E2E)
-사내 Gateway 어댑터, 정규식 탐지, 사전 탐지, 병합, 인메모리 볼트, 기본 변환(keep/mask/redact/
-tokenize). 파이프라인은 입력에서 `탐지 → 전부 토큰화 → 재조립 → transform 반환`.
+PostgreSQL 스키마 적용(`postgres-schema.sql`), 사내 Gateway 어댑터, 정규식 탐지, 사전 탐지, 병합,
+PostgreSQL 볼트(`token_vault`, 앱레벨 AES-GCM), 기본 변환(keep/mask/redact/tokenize).
+파이프라인은 입력에서 `탐지 → 전부 토큰화 → 재조립 → transform 반환`.
 **검증:** Gateway 요청의 주민번호가 토큰으로 치환되어 업스트림에 전달되고, 프록시가 치환 본문을 사용.
 
 ### Phase 2 — 세션 컨텍스트 + 멀티턴
@@ -476,13 +485,14 @@ Input Guard(패턴 룰)와 Output Guard(타인 PII 재생성 / 인젝션 순응 
 **검증:** 인젝션 요청 차단, 응답의 토큰이 원본으로 복원되어 사용자에게 표시.
 
 ### Phase 4 — 목적 분석 + 정책 엔진
-규칙 기반 목적 분류기, role 해석기, `policy.yaml` + 정책 엔진, 변환에 generalize/aggregate 추가.
+규칙 기반 목적 분류기, role 해석기, PostgreSQL `policy_*` 테이블(시드 `policy.yaml`) + 정책 엔진,
+변환에 generalize/aggregate 추가.
 파이프라인은 `목적 → 정책 평가 → 엔티티별 조치 → 변환 실행`.
 **검증:** 같은 PII라도 목적이 "요약"이면 토큰화, "코딩 지원"이면 차단.
 
 ### Phase 5 — 로깅 + 대시보드 + NER
-구조화 감사 로그(JSONL + SQLite), `/events` 엔드포인트(대시보드 tail), 한국어 NER 통합 및 병합
-편입, 임계값 튜닝.
+구조화 감사 로그를 PostgreSQL `log_events` 로 정착(스테이지 판정 수렴), `/events` 엔드포인트
+(대시보드 tail), 한국어 NER 통합 및 병합 편입, 임계값 튜닝.
 **검증:** 대시보드에 세션별 탐지·목적·조치·지연이 실시간 표시되고 원문이 노출되지 않음.
 
 ### Phase 6 — 성능 평가 + 레드팀

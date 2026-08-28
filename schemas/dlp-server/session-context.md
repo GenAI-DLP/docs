@@ -54,5 +54,7 @@ DDL 원본: [`postgres-schema.sql`](postgres-schema.sql) §1
 
 ## 데모 구현
 
-`context/store.py` 의 InMemory 구현이 이 구조를 딕셔너리로 흉내낸다(TTL 스윕 포함). 컬럼 의미·불변식은
-동일하게 지킨다. Redis/PostgreSQL 승격은 [dlp-server-architecture](../../architecture/dlp-server-architecture.md) §8.
+`context/store.py` 의 `SessionStore` 인터페이스 뒤에 둔다. 데모 백엔드는 **미정** — 인메모리 딕셔너리
+(TTL 스윕) 또는 PostgreSQL(`sessions` / `session_entities`). 멀티턴(e) 착수 시점에 확정한다.
+어느 쪽이든 컬럼 의미·불변식은 이 스키마를 지키고, 볼트·감사와는 FK가 없다. Redis 승격은
+[dlp-server-architecture](../../architecture/dlp-server-architecture.md) §8.
