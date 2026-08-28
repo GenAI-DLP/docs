@@ -56,6 +56,8 @@ Stage = Callable[[AnalysisContext], AnalysisContext]
 | `accumulated` | `dict[str, list[Span]]` | [4] 멀티턴 (e) | 세션 누적 엔티티. 초기값 `{}` |
 | `risk_score` | `float` | [4] 멀티턴 (e) | `0.0 ~ 1.0`. 초기값 `0.0` |
 | `injection` | `InjectionVerdict` | [2] Input Guard (c) | `hit` / `score` / `pattern`. 초기값 `hit=False` |
+| `blocked` | `bool` | 아무 스테이지 | injection/risk 외 사유로 차단 요청. 초기값 `False` |
+| `block_reason` | `dict \| None` | 아무 스테이지 | `blocked` 시 근거. `guardrail_hits` 한 조각 형태 `{"type": "..."}`. 초기값 `None` |
 
 **본문 변경**은 `ctx.turns[i].text` 를 수정하는 방식으로 한다. 파이프라인이 이후 어댑터로 재조립한다 (§5).
 
@@ -102,6 +104,7 @@ _OUTPUT_STAGES: list[Stage] = [ ... ]
 파이프라인은 스테이지를 전부 실행한 뒤 `ctx` 를 보고 `Decision.action` 을 정한다.
 
 1. **block** — 아래 중 하나라도 참이면:
+   - `ctx.blocked == True` (근거는 `ctx.block_reason` 를 `guardrail_hits` 에 첨부)
    - `ctx.injection.hit == True`
    - `ctx.risk_score >= config.risk.hard_block` (기본 `0.8`)
 2. **allow** — block 이 아니고, 스테이지가 `ctx.turns[*].text` 를 **바꾸지 않았으면**.
@@ -112,9 +115,13 @@ _OUTPUT_STAGES: list[Stage] = [ ... ]
 `allow` / `transform` 판정은 스테이지 실행 전후의 `[t.text for t in ctx.turns]` 를 비교해 결정한다
 (재직렬화가 공백·키 순서를 바꿔 생기는 오탐 방지).
 
-> **현재 한계:** block 신호는 `injection.hit` / `risk_score` 두 경로뿐이다. 그 밖의 사유
-> (명시적 데이터 반출 요청, 정책상 무조건 차단, Output Guard 의 타인 PII 재생성·기밀 유출 등)를
-> 스테이지가 직접 표현할 채널은 아직 없다. 확장 방식은 논의 중이며 별도 갱신한다 (§10).
+> **block 신호 채널:**
+> - `injection.hit` — Input Guard(c) 전용. 프롬프트 인젝션·탈옥.
+> - `risk_score >= hard_block` — 멀티턴(e) 전용. 누적 위험도. 누적 스테이지가 input 에만 있어 input 경로에서만 검사.
+> - `ctx.blocked` (+ `ctx.block_reason`) — **그 밖의 모든 사유.** 명시적 데이터 반출 요청, 정책상 무조건 차단,
+>   Output Guard 의 타인 PII 재생성·기밀 유출 등. input·output 양쪽에서 동작.
+>
+> `_run_stages` 는 `ctx.blocked` 가 서면 이후 스테이지를 실행하지 않는다(조기 중단).
 
 ---
 
@@ -165,6 +172,8 @@ class Decision:
 
 - 시그니처는 `def stage(ctx: AnalysisContext) -> AnalysisContext`.
 - `ctx` 에서 필요한 값을 읽고, 자기 담당 필드를 채우고, `ctx` 를 반환한다.
+- 차단을 요청하려면 `ctx.blocked = True` 로 두고 `ctx.block_reason = {"type": "...", ...}` 에 근거를 담는다.
+  (`injection.hit` / `risk_score` 는 각각 Input Guard / 멀티턴 전용 신호이므로 그 외 스테이지는 쓰지 않는다.)
 - 교체 가능성이 있는 지점(목적 분류기, Input Guard 등)은 인터페이스 뒤에 두고 규칙 기반을 기본값으로 한다.
 - 유닛 테스트는 스테이지 함수를 직접 호출한다. 파이프라인 통합 테스트는 `_INPUT_STAGES` 를 교체(monkeypatch)한다.
 
@@ -195,5 +204,4 @@ _INPUT_STAGES: list[Stage] = [
 
 파이프라인이 요청마다 `_pii_detect` 를 실행하고, 그 결과(`ctx.new_turn_spans`)를 이후 스테이지
 ([4] 멀티턴, [5] 정책)가 소비한다. block/transform/로그는 파이프라인이 처리한다.
-
 
