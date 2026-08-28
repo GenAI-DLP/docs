@@ -24,7 +24,7 @@
 
 | ID | 파일 | 기능 | 우선순위 | 상태 |
 |---|---|---|---|---|
-| a | [`dlp-server/a_reversible-tokenization.md`](dlp-server/a_reversible-tokenization.md) | 가역적 토큰화 | 필수 | ⬜ |
+| a | [`dlp-server/a_reversible-tokenization.md`](dlp-server/a_reversible-tokenization.md) | 가역적 토큰화 | 필수 | ✅ |
 | b | [`dlp-server/b_hybrid-pii-detection.md`](dlp-server/b_hybrid-pii-detection.md) | 하이브리드 PII 탐지 (regex + 사전 + NER) | 필수 | ⬜ |
 | c | [`dlp-server/c_bidirectional-guardrails.md`](dlp-server/c_bidirectional-guardrails.md) | 양방향 가드레일 (Input / Output) | 필수 | ⬜ |
 | d | [`dlp-server/d_agent-tool-control.md`](dlp-server/d_agent-tool-control.md) | AI Agent / MCP Tool 통제 | 후순위 | ⬜ |
