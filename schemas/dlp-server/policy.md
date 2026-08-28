@@ -60,8 +60,10 @@ DDL 원본: [`postgres-schema.sql`](postgres-schema.sql) §3
 
 ## 초안 (YAML 표현)
 
-DB 이전 단계에서는 아래 `policy.yaml` 이 같은 내용을 담는다. 컬럼 매핑: `rules[*]` → `policy_rules`,
-`risk_overrides[*]` → `policy_risk_overrides`, `defaults` → 와일드카드 최저 우선 규칙.
+`policy.yaml` 은 정책의 **작성·시드 포맷**이다. 부트스트랩 시 이 내용을 `policy_versions` /
+`policy_rules` / `policy_risk_overrides` 로 적재하고, 런타임 `policy/engine.py` 는 PostgreSQL에서
+읽는다. 컬럼 매핑: `rules[*]` → `policy_rules`, `risk_overrides[*]` → `policy_risk_overrides`,
+`defaults` → 와일드카드 최저 우선 규칙.
 
 ```yaml
 purposes: [customer_support, doc_summarize, code_help, data_analysis, fraud_investigation, unknown]
@@ -82,5 +84,6 @@ risk_overrides:
 
 ## 데모 구현
 
-`policy/engine.py` + `policy/policy.yaml`. 경량 룰 평가기(~100줄). OPA/Rego, 관리자 CRUD API는 확장.
+`policy/engine.py` 가 PostgreSQL `policy_*` 테이블을 읽어 평가한다(경량 룰 평가기 ~100줄).
+규칙 시드는 `policy/policy.yaml` → 부트스트랩 적재. OPA/Rego, 관리자 CRUD API는 확장.
 테스트는 `(purpose × role × entity)` 전 조합 매트릭스.

@@ -54,5 +54,6 @@ DDL 원본: [`postgres-schema.sql`](postgres-schema.sql) §4
 
 ## 데모 구현
 
-`logging/events.py` — `LogEvent` 구조화 후 **JSONL + SQLite** sink. 컬럼 의미는 위와 동일.
-검색엔진(Elasticsearch 등) 이관은 확장.
+`logging/events.py` — `LogEvent` 구조화 후 **PostgreSQL `log_events` INSERT** sink. 컬럼 의미는
+위와 동일. `/events` 는 이 테이블을 최신순으로 조회한다. append-only 파티셔닝·검색엔진
+(Elasticsearch 등) 이관은 확장.
