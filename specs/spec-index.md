@@ -8,6 +8,16 @@
 
 ---
 
+## dlp-server — 공통 계약
+
+기능 a~h 를 붙이기 전에 읽는다. 아키텍처 문서 §3/§5 가 설계 의도라면, 이건 구현된 계약.
+
+| 파일 | 내용 | 상태 |
+|---|---|---|
+| [`dlp-server/pipeline-stage-contract.md`](dlp-server/pipeline-stage-contract.md) | 파이프라인 스테이지 구현 계약 — `Stage` 시그니처, `AnalysisContext` 필드, 스테이지 등록·실행 순서, block/allow/transform 판정 규칙, `reason_obj` 형태, fail-closed | ✅ |
+
+---
+
 ## dlp-server (기능 a~h)
 
 기능 개요와 모듈 매핑은 [`../architecture/dlp-server-architecture.md`](../architecture/dlp-server-architecture.md) §6.
