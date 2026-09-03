@@ -25,10 +25,10 @@
 | ID | 파일 | 기능 | 우선순위 | 상태 |
 |---|---|---|---|---|
 | a | [`dlp-server/a_reversible-tokenization.md`](dlp-server/a_reversible-tokenization.md) | 가역적 토큰화 | 필수 | ✅ |
-| b | [`dlp-server/b_hybrid-pii-detection.md`](dlp-server/b_hybrid-pii-detection.md) | 하이브리드 PII 탐지 (regex + 사전 + NER) | 필수 | ⬜ |
-| c | [`dlp-server/c_bidirectional-guardrails.md`](dlp-server/c_bidirectional-guardrails.md) | 양방향 가드레일 (Input / Output) | 필수 | 🚧 |
+| b | [`dlp-server/b_hybrid-pii-detection.md`](dlp-server/b_hybrid-pii-detection.md) | 하이브리드 PII 탐지 (regex + 사전 + NER) | 필수 | 🚧 (구현·배선됨, 스펙 문서 미완) |
+| c | [`dlp-server/c_bidirectional-guardrails.md`](dlp-server/c_bidirectional-guardrails.md) | 양방향 가드레일 (Input / Output) | 필수 | ✅ (Input/Output 구현·배선. eval 튜닝 남음) |
 | d | [`dlp-server/d_agent-tool-control.md`](dlp-server/d_agent-tool-control.md) | AI Agent / MCP Tool 통제 | 후순위 | ⬜ |
-| e | [`dlp-server/e_multiturn-context-analysis.md`](dlp-server/e_multiturn-context-analysis.md) | Multi-turn Context 분석 | 필수 | ⬜ |
+| e | [`dlp-server/e_multiturn-context-analysis.md`](dlp-server/e_multiturn-context-analysis.md) | Multi-turn Context 분석 | 필수 | ✅ |
 | f | [`dlp-server/f_purpose-based-access-control.md`](dlp-server/f_purpose-based-access-control.md) | 목적 기반 동적 데이터 접근 제어 | 필수 | ✅ |
 | g | [`dlp-server/g_dynamic-data-transformation.md`](dlp-server/g_dynamic-data-transformation.md) | 동적 데이터 변환 (mask/generalize/…) | 필수 | ✅ |
 | h | [`dlp-server/h_agent-behavior-sequence.md`](dlp-server/h_agent-behavior-sequence.md) | Agent 행동 시퀀스 분석 | 후순위 | ⬜ |

@@ -1,9 +1,8 @@
 # 목적 기반 동적 데이터 접근 제어
 
-> **구현 상태.** `purpose/` · `policy/` 모듈과 입력 [5] 스테이지는 구현·배선됨(dlp-server #17).
-> 규칙 분류기 + 정책 엔진은 완성. 조치 실행·`access_scope` 조립은 기능 g(#20). 탐지([3])·멀티턴([4])이
-> 아직 파이프라인에 없어 실행 시 `span_actions` 는 비어 있고 `purpose` 만 채워진다. 이 문서는
-> 완성 기준 계약이며, 현재 구현 상태·남은 작업은 §7.
+> **구현 상태.** `purpose/` · `policy/` 모듈과 입력 [5] 스테이지 구현·배선됨(dlp-server #17).
+> 탐지([3])·멀티턴([4])도 배선 완료 → 실 요청에서 `span_actions` 가 채워지고 `risk_score` 도
+> 세션 누적을 반영한다. 조치 실행·`access_scope` 조립은 기능 g. 남은 작업은 §7.
 
 **우선순위:** 필수
 **한 줄 정의:** 요청 목적·요청자 role·엔티티 타입·누적 위험도를 조합해 탐지된 엔티티마다 조치(keep/mask/generalize/aggregate/tokenize/synthetic/redact/block)를 결정한다.
@@ -31,10 +30,10 @@
   "turns": [
     {"role": "user", "text": "이 고객 민원 건 요약해줘. 연락처 010-1234-5678"}
   ],
-  "new_turn_spans": [                 // 기능 b 산출 (현재 미배선 → E2E 에서는 빈 리스트)
+  "new_turn_spans": [                 // 기능 b 산출 (pii_detect_stage 가 채움)
     {"type": "PHONE", "value": "010-1234-5678", "start": 20, "end": 33, "confidence": 0.9, "source": "regex"}
   ],
-  "risk_score": 0.0,                  // 기능 e 산출 (현재 미배선 → 0.0)
+  "risk_score": 0.0,                  // 기능 e 산출 (multiturn_stage 가 세션 누적으로 갱신)
   "injection": {"hit": false, "score": 0.0, "pattern": null}
 }
 ```
@@ -113,7 +112,7 @@
 |---|---|---|
 | `config.purpose.backend` (`DLP_PURPOSE__BACKEND`) | `rule` | `rule` \| `llm`. `llm` 이면 `_classifier` 를 모델 구현으로 교체 |
 | `config.purpose.llm_timeout_sec` | `1.5` | LLM 분류기 타임아웃(초). 규칙 fallback 과 함께 씀 |
-| `config.risk.hard_block` (`DLP_RISK__HARD_BLOCK`) | `0.8` | 파이프라인 내장 위험도 차단 임계. 정책의 `risk_score >= N` 오버라이드와 별개(방어 깊이) |
+| `config.risk.hard_block` (`DLP_RISK__HARD_BLOCK`) | `0.6` | 파이프라인 내장 위험도 차단 임계. 정책 시드의 `risk_score >= 0.8` 오버라이드와 값이 다른 건 의도 — 내장 컷오프가 더 낮게(먼저) 걸린다. `multiturn.combo_cap` 과 같은 값이어야 함(e 스펙 §3.3) |
 | `app/policy/policy.yaml` | — | `(목적×role×엔티티)→조치` 매트릭스 + `defaults` + `risk_overrides` 시드 |
 
 정책 데이터는 `scripts/seed_policy.py` 가 `policy.yaml` → `policy_versions` / `policy_rules` /
@@ -176,15 +175,14 @@ DB 불필요, 시드→`decide` 는 PostgreSQL 필요).
 
 **남은 작업:**
 
-- **전체 연결 테스트** — 탐지([3])·멀티턴([4]) 배선 후 입력 경로 E2E(`탐지 → 정책 → 변환`) 관통 검증.
-  현재는 `span_actions` 가 비어 있어 스테이지가 `purpose` 만 채우고 통과한다.
-- **`risk_score` 연동** — 기능 e 가 붙기 전까지 항상 `0.0` → `risk_score` 오버라이드는 유닛 테스트로만 검증.
 - **`access_scope` 정책화** — `tokenize` 복원 범위는 g 가 요청 맥락으로 조립
   ([`g_dynamic-data-transformation.md`](g_dynamic-data-transformation.md) §3.3). 정책이 직접 지정하려면
   `policy_rules` 에 `restore_roles` / `restore_purposes` 컬럼 추가(직무분리·목적제한 설정화).
 - **LLM 분류기** — `config.purpose.backend == "llm"` seam 만 있고 규칙이 기본 구현. 모델 백엔드는 후속.
 - **복원 시점 정책 재평가** — 볼트 `_resolve_scope` 를 정책 엔진 재평가로 바꿀지 미정
   ([`a_reversible-tokenization.md`](a_reversible-tokenization.md) §7, 아키텍처 §12).
-- **`AnalysisContext` 필드 정식 반영** — `purpose` / `purpose_confidence` / `span_actions` 를
-  [`pipeline-stage-contract.md`](pipeline-stage-contract.md) §3 표에 반영.
 - **정책 관리 UI** — 현재는 `policy.yaml` + 시드 스크립트. 관리자 CRUD·버전 롤백 API 는 확장.
+
+**완료된 항목:** 탐지([3])·멀티턴([4]) 배선 → `span_actions`·`risk_score` 실 데이터로 채워짐.
+`AnalysisContext` 의 `purpose` / `purpose_confidence` / `span_actions` 는
+[`pipeline-stage-contract.md`](pipeline-stage-contract.md) §3 표에 반영됨.

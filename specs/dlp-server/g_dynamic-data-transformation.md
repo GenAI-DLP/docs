@@ -1,9 +1,10 @@
 # 동적 데이터 변환
 
-> **구현 상태.** `transform/apply.py` 와 입력 [6] 스테이지는 구현·배선됨(dlp-server #20).
-> 현재는 `keep` / `mask` / `redact` / `tokenize` 4종만 동작하고 `generalize` / `aggregate` /
-> `synthetic` 은 `mask` 로 폴백한다. 탐지([3])가 아직 파이프라인에 없어 실행 시 `span_actions` 는
-> 비어 있다. 이 문서는 완성 기준 계약이며, 현재 구현 범위·남은 작업은 §7.
+> **구현 상태.** `transform/apply.py` 의 `transform_stage` 와 입력 [6] 배선 완료(#20 이후 확장).
+> 8개 action 전부 핸들러가 있다: `keep` / `mask`(타입별) / `redact` / `tokenize` / `synthetic`
+> (이름 풀 + 숫자 무작위) / `aggregate`(그룹 합계·평균 요약) / `generalize`(RRN → `<AGE:x대><SEX:y>`,
+> 그 외 타입은 `mask` 폴백). 탐지([3])·멀티턴([4])도 배선돼 실 요청에서 `span_actions` 가 채워진다.
+> 남은 작업은 §7.
 
 **우선순위:** 필수
 **한 줄 정의:** 정책 엔진(f)이 엔티티마다 결정한 조치를 실제로 실행해 전송 본문을 변환한다. 같은 PII 타입이라도 목적·role·위험도 조합에 따라 다른 전략이 런타임에 선택된다(정적 마스킹표가 아님).
@@ -18,7 +19,8 @@
 
 ## 1. 입력 예시
 
-스테이지 `apply_transforms(ctx)` 는 `AnalysisContext` 하나를 받는다. `span_actions` 는 f 가 채운다.
+스테이지 `transform_stage(ctx)` 는 `AnalysisContext` 하나를 받는다(`apply_transforms` 는 호환용
+별칭). `span_actions` 는 f 가 채운다.
 
 ```jsonc
 // AnalysisContext (요약)
@@ -74,9 +76,9 @@
 | `mask` | 타입별 비가역 부분 마스킹 (§3.2) |
 | `redact` | `[삭제됨]` 로 치환 |
 | `tokenize` | `vault.tokenize(session_id, span.type, span.value, access_scope=…)` → `<PII:{TYPE}:{n}>` (§3.3) |
-| `generalize` | 범주로 일반화. 주민번호 → `<AGE:30대><SEX:여>`, 나이 `35` → `30대` |
-| `aggregate` | 목록을 통계로. 금액 목록 → 합계 / 평균 / 구간 |
-| `synthetic` | 형식이 같은 가짜 값. 실명 → 무작위 그럴듯한 이름 |
+| `generalize` | **RRN 만 구현** — `<AGE:{연령대}대><SEX:{남\|여}>` (주민번호 앞 6자리 + 성별자리로 계산). 그 외 타입은 `mask` 로 폴백 + info 로그 |
+| `aggregate` | **그룹 처리** — 개별 span 은 자리를 비우고, 같은 턴의 `aggregate` 대상 전부를 모아 텍스트 끝에 ` [집계: 합계 N / 평균 M / 건수 K]` 를 덧붙인다. 금액 파싱은 숫자·`.` 만 추출 |
+| `synthetic` | `NAME` → 고정 이름 풀에서 무작위. 그 외(숫자 포함) → 자릿수 유지하고 숫자만 무작위. 숫자 없으면 `mask` 폴백 |
 
 ### 3.2 타입별 마스킹 (`_mask(entity_type, value)`)
 
@@ -87,7 +89,7 @@
 | `PHONE` | 3파트면 가운데 파트 `*` (아니면 카드 규칙) | `010-1234-5678` → `010-****-5678` |
 | `EMAIL` | 로컬파트 첫 글자 + `***` + `@도메인` | `test@x.co.kr` → `t***@x.co.kr` |
 | `NAME` | 가운데 글자 `*` (2자면 `홍*`, 1자면 `*`) | `홍길동` → `홍*동` |
-| 그 외 | 값 길이만큼 `*` | `AMOUNT 1000000` → `*******` |
+| 그 외 | 첫 글자 + 가운데 `*` + 끝 글자 (`_mask_middle`) | `1000000` → `1*****0` |
 
 ### 3.3 토큰화 시 `access_scope` 조립 (`_access_scope(ctx)`)
 
@@ -109,9 +111,19 @@
 
 ### 3.5 fail 방향
 
-- 변환 중 오류(마스킹 버그 · 볼트 예외 · 볼트 키 미설정) → **fail-closed.** 예외를 전파하지 않고
-  `ctx.blocked = true`, `ctx.block_reason = {"type": "transform", "note": "stage_error"}`.
-  변환에 실패한 원문이 그대로 나가면 안 되기 때문이다.
+**목표: fail-closed** — 변환에 실패한 원문이 그대로 나가면 안 된다.
+
+- `tokenize` 오류(볼트 예외 · `DLP_VAULT__KEY` 미설정 등) → `_tokenize` 가 예외를 잡아
+  `[삭제됨]`(redact)로 대체한다. 원문은 안 나가지만 요청 자체는 계속 진행된다.
+- 알 수 없는 action → `keep`(원본 유지) + warning 로그.
+- 그 외 스테이지 예외(마스킹 함수 버그 등)는 `transform_stage` 에 자체 `try/except` 가 아직 없어
+  `pipeline.analyze()` 상위 처리기로 전파된다 → `fail_action`(기본 `block`)으로 잡힌다. 단
+  `DLP_FAIL_ACTION=allow` 시연 스위치에서는 원문이 통과할 수 있다.
+
+> **알려진 갭:** `transform_stage` 에 스테이지 레벨 fail-closed(`try/except → ctx.blocked`)가 없다.
+> 마스킹 버그가 상위 `fail_action` 에 의존하는 구조라, `allow` 스위치와 조합되면 유출 경로가 된다.
+> 스테이지에서 직접 `ctx.blocked` + `block_reason={"type": "transform", "note": "stage_error"}` 를
+> 세팅하도록 보강 예정(§7).
 
 ## 4. 파라미터 · 설정값
 
@@ -132,8 +144,8 @@
 | 한 턴에 span 여럿 | `start` 역순 치환 → 길이가 바뀌어도 앞 span offset 유지 |
 | `user` 턴 없음 | 무동작 통과 |
 | 과거 `user` 턴 | 건드리지 않음 (마지막 user 턴만) |
-| 알 수 없는 `entity_type` 마스킹 | 값 길이만큼 `*` |
-| `tokenize` 인데 `DLP_VAULT__KEY` 없음 | `tokenize` 가 raise → 스테이지가 fail-closed(block) |
+| 알 수 없는 `entity_type` 마스킹 | 첫/끝 글자만 남기고 가운데 `*` (`_mask_middle`) |
+| `tokenize` 인데 `DLP_VAULT__KEY` 없음 | `_tokenize` 가 예외를 잡아 `[삭제됨]`(redact)로 대체. 원문 미유출, 요청은 진행 (§3.5) |
 | 같은 원본 값 span 여럿 | 각각 치환. `tokenize` 는 볼트가 `value_hash` 로 같은 라벨 재사용(결정론) |
 
 ## 6. 테스트 케이스표
@@ -152,17 +164,16 @@
 
 ## 7. 현재 구현 상태 · 남은 작업
 
-- **현재 MVP (dlp-server #20):** `keep` / `mask` / `redact` / `tokenize` 4종만 동작. 마스킹은 타입별
-  고정 규칙(§3.2), `access_scope` 는 요청 맥락(§3.3), span 은 마지막 `user` 턴 대상. `_INPUT_STAGES` [6] 배선.
-- **추후 업데이트:** `generalize` / `aggregate` / `synthetic` 조치, 정책 기반 복원 범위, 멀티턴 turn 매핑,
-  전체 연결 테스트. 아래 상세.
+- **동작 중:** `keep` / `mask`(타입별 §3.2) / `redact` / `tokenize`(`access_scope` = 요청 맥락 §3.3) /
+  `synthetic` / `aggregate`(그룹 요약) / `generalize`(RRN 만). span 은 마지막 `user` 턴 대상.
+  `_INPUT_STAGES` [6] 배선. 탐지([3])·멀티턴([4]) 배선돼 실 `span_actions` 로 관통된다.
 
-**남은 작업 (상세):**
+**남은 작업:**
 
-- `generalize` / `aggregate` / `synthetic` — 현재 `mask` 로 폴백 + warning. 범주화·집계·합성 규칙 상세 미정.
+- **`transform_stage` fail-closed 보강** — §3.5 갱. 스테이지 레벨 `try/except → ctx.blocked` 부재.
+- `generalize` — RRN 외 타입(나이·주소 등) 규칙. 현재는 `mask` 폴백.
 - `access_scope` 정책화 — `policy_rules` 에 `restore_roles` / `restore_purposes`(nullable) 컬럼 추가.
 - span↔turn 매핑 — 현재 "마지막 `user` 턴" 가정. 멀티턴 요청의 다른 턴 PII 는 미처리 → `Span.turn_index` 도입(탐지 모듈과 협의).
 - `reason_obj.transforms` 상세 — 현재 `{entity, action}` 만. `token_label` / `masked_preview` 를 담으려면 `AnalysisContext.transforms` 필드.
 - 배치 토큰화 `tokenize_many` — 요청당 PII 다수일 때 1 트랜잭션.
 - 형식 보존 암호화(FPE) — 카드·전화처럼 형식이 고정된 데이터의 마스킹 대안.
-- 전체 연결 테스트 — 탐지([3])·멀티턴([4]) 배선 후 입력 경로 E2E(`탐지 → 정책 → 변환`) 관통 검증.

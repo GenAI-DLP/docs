@@ -11,7 +11,11 @@
 
 **구현 현황 [확정]:** `pipeline.py`의 `_INPUT_STAGES`에 `multiturn_stage`가 실제로 배선되어 있고, 로드맵 §9 Phase 2 검증 시나리오("N턴 분산 입력 → 3턴째 누적 위험도로 차단")를 실제 gRPC 요청 및 pytest 통합 테스트로 확인했다. 아래 문서는 스텁이 아니라 **동작하는 코드 기준**으로 작성됐다.
 
-**스코프 경계:** 이 기능(e)은 입력 경로(`_INPUT_STAGES`)에만 관여한다. 출력 경로(`_OUTPUT_STAGES = [detokenize_stage]`)는 `transform/apply.py` 담당자가 별도로 배선 중이며, `Output Guard`(기능 c-output)는 아직 미배선이다. 다만 §8에 정리했듯 출력 경로 쪽에서 이 기능의 `SessionState`에 필드 추가를 요청하는 TODO가 하나 걸려 있다.
+**스코프 경계:** 이 기능(e)은 입력 경로(`_INPUT_STAGES`)에 관여한다. 출력 경로
+(`_OUTPUT_STAGES = [output_guard, detokenize_stage]`)는 기능 c-output·a 담당이지만, 그중
+`detokenize_stage`가 `context.get_last_purpose(session_id)`로 이 기능의 세션 상태를 읽는다.
+§8의 "SessionState에 purpose 필드 추가" TODO는 **해소됨** — `SessionState.purpose` +
+`stage.py::remember_purpose_stage`로 구현됐다(§8 참고).
 
 ---
 
@@ -156,7 +160,7 @@ ctx.accumulated = {"ACCOUNT": [<이번 턴 Span>]}   # 이번 턴 span만 타입
 6. **세션 식별자 재사용/충돌** — [미정] 프록시의 세션 식별 우선순위(§2.3)가 원격 주소까지 내려가면 서로 다른 사용자가 같은 `session_id`를 쓸 위험 — accumulator 레벨에서 막을 수 없다. 프록시 쪽 이슈로 별도 트래킹 필요.
 7. **NER 편입 전 span 도착 시차 (Phase 5)** — [미정] 아직 범위 밖.
 8. **`value_hash` 충돌** — [확정] SHA-256 앞 16바이트 사용 (`accumulator.hash_value`). 실질적 충돌 위험 낮음.
-9. **세션 만료 시 vault 미동반 정리** — [미정, 신규] `InMemorySessionStore`에 `on_expire` 콜백 자리는 있고 콜백이 실제로 발화하는 것까지는 테스트로 확인됐다(§6 #8). 다만 `transform/vault.py`를 실제로 호출하는 코드가 아직 없다 — 만료된 세션의 토큰이 vault에 그대로 남는다.
+9. **세션 만료 시 vault 동반 정리** — [확정] `stage.py::_default_on_expire`가 `InMemorySessionStore`의 `on_expire` 훅으로 연결돼 있어, 세션 만료(조회 시점 감지 또는 스윕) 시 `transform.vault.revoke_session(session_id)`를 호출해 해당 세션 토큰을 soft revoke 한다. 암호문 하드 삭제는 볼트 자체 `expires_at` + `purge_expired()` 주기 작업이 담당(세션 TTL과 분리, 아키텍처 §7.2).
 
 ---
 
@@ -173,14 +177,14 @@ ctx.accumulated = {"ACCOUNT": [<이번 턴 Span>]}   # 이번 턴 span만 타입
 | 5 | 윈도우 밖 재등장 (first_turn 유지) | ✅ | `test_context_smoke.py::test_case5_window_reentry_no_new_first_turn` |
 | 6 | 고속 다턴 (velocity 가중치) | ✅ | `test_context_smoke.py::test_case6_velocity` |
 | 7 | 세션 TTL 만료 후 초기화 | ✅ | `test_context_smoke.py::test_case7_ttl_expiry_resets_session` |
-| 8 | 세션 만료 시 vault 동반 정리 | ✅ (훅만) | `test_accumulator.py::test_case8_on_expire_fires_on_load_triggered_expiry`, `test_case8_on_expire_fires_on_sweep` — ⚠️ 콜백 발화만 검증됨, 실제 `vault.purge_expired` 연결은 §5 #9 참고 |
+| 8 | 세션 만료 시 vault 동반 정리 | ✅ | `test_accumulator.py::test_case8_on_expire_fires_on_load_triggered_expiry`, `test_case8_on_expire_fires_on_sweep` — 콜백 발화 검증. 콜백 본체(`_default_on_expire` → `vault.revoke_session`)는 §5 #9 |
 | 9 | injection 동시 발생 시 override 우선 | ✅ | `test_context_integration.py::test_injection_short_circuits_multiturn_stage` |
 | 10 | 조합 상한(cap) 초과 방지 | ✅ | `test_accumulator.py::test_case10_combo_cap_prevents_overflow` — 4개 타입 동시 성립(이론상 합 1.45)도 `combo_cap` 이하로 눌림 확인 |
 | — | **설정 배선** (`configure()` 없이 `app.config`에서 정상 로드) | ✅ | `test_context_smoke.py::test_default_config_loads_from_app_config_without_explicit_configure` |
 | — | **실제 파이프라인 E2E** — 3턴 분산 → block (사전 등재 이름) | ✅ | `test_context_integration.py::test_three_turn_distributed_input_triggers_block` |
 | — | **실제 파이프라인 E2E** — 정규식 전용 조합 → block (사전 미등재 이름) | ✅ | `test_context_integration.py::test_regex_only_combo_triggers_block_without_dictionary_name` |
 
-**§6 커버리지: 10/10 완료.** 단 #8은 "vault 동반 정리"라는 이름값을 완전히 하려면 §5 엣지케이스 9(vault 미연결)가 먼저 풀려야 한다 — 지금은 콜백이 울리는 것까지만 보장한다.
+**§6 커버리지: 10/10 완료.** #8의 `on_expire` 콜백 본체는 §5 #9대로 `vault.revoke_session`에 연결됐다.
 
 ---
 
@@ -189,25 +193,27 @@ ctx.accumulated = {"ACCOUNT": [<이번 턴 Span>]}   # 이번 턴 span만 타입
 이 스펙의 스코프는 아니지만 e2e 검증 과정에서 실제로 재현된 버그라 기록해둔다.
 
 - **`detect/regex_rules.py`**: `_ACCOUNT_PATTERN`과 `_PHONE_PATTERN`이 `010-1234-5678` 같은 값에서 동시에 매치되어 `merge.py`가 타입 충돌 경고를 낸다. 어느 쪽이 최종 채택될지가 우연에 가깝다 (source 우선순위 동점 시 먼저 탐지된 쪽).
-- **`transform/vault.py`**: `token_vault.session_id` 컬럼이 UUID 타입인데, 실제 `session_id`는 프록시가 헤더/쿠키/원격주소에서 뽑은 임의 문자열(§2.3)이라 UUID 형식이 보장 안 된다. `session_id`가 UUID가 아니면 `tokenize()`가 `InvalidTextRepresentation`으로 실패하고 `transform_stage`가 `redact`로 폴백한다 (겉으로는 안 터지지만 tokenize가 사실상 항상 실패하는 상태로 방치될 수 있음).
+- **`transform/vault.py` — 해소됨.** `token_vault.session_id`(UUID)와 wire `session_id`(임의 문자열, §2.3)의 타입 불일치는 `app/ids.py::coerce_session_uuid`로 해결됐다: UUID 꼴이면 그대로, 아니면 `uuid5`로 결정론적 매핑. 감사 로그(`log_events`)와 볼트가 같은 헬퍼를 써서 두 테이블 JOIN도 가능하다.
 
 ---
 
-## 8. 확장 지점 — 다른 기능이 `SessionState`에 거는 기대 [미정]
+## 8. 출력 경로가 `SessionState`에 거는 기대 — [해소됨]
 
-`transform/apply.py::detokenize_stage`(출력 경로 [2])의 docstring에 이런 TODO가 있다:
+출력 경로 `detokenize_stage`는 별개 `InspectRequest`라 원 요청의 목적을 모른다. `access_scope`에
+`"*"`가 없는 토큰이 output 단계에서 복원되려면 세션이 목적을 기억해야 했다.
 
-> ⚠️ 알려진 한계: `ctx.purpose`는 output 요청에서 항상 `None`이다. `purpose_policy_stage`는 `direction == "input"`일 때만 돌기 때문에, 이 별개의 output `InspectRequest`는 애초에 원 요청의 purpose를 모른다. **세션 스토어(기능 e, context 쪽)가 세션별 purpose를 기억해뒀다가 여기서 읽어오게 되면 이 TODO는 해소된다.** 그 전까지는 `access_scope`에 `"*"`가 없는 토큰은 output 단계에서 복원되지 않는다.
+**해결:** `SessionState`에 `purpose: str | None` 필드를 추가하고, 저장은 **별도 스테이지**
+`stage.py::remember_purpose_stage`가 맡는다 — `_INPUT_STAGES`에서 `purpose_policy_stage`
+*다음*, `transform_stage` *이전*에 위치해 `ctx.purpose`가 채워진 뒤 세션에 기록한다
+(`multiturn_stage`는 `purpose_policy_stage`보다 먼저 돌아 그 시점엔 `ctx.purpose`가 `None`이라
+거기서 저장 불가 — 그래서 스테이지를 나눴다). 출력 경로는 `stage.py::get_last_purpose(session_id)`로
+읽어 `vault.detokenize_text(..., purpose=...)`에 넘긴다.
 
-**현재 상태:** `context/store.py::SessionState`에는 `purpose` 필드가 없다. `turn_count`, `entities`, `graph_edges`, `turn_timestamps`, `risk_score`, `risk_reasons`만 있다.
-
-**왜 지금 안 넣었는가:** 이 기능(e)의 스코프는 "PII 조합 위험도"이지 "요청 목적 추적"이 아니다(§6-f가 목적 담당). `SessionState`에 `purpose`를 얹는 게 자연스러워 보이긴 하지만, 그러면 이 파일이 두 기능(e, f)의 상태를 동시에 들고 있는 셈이 되어 책임 경계가 흐려진다. 또한 `multiturn_stage`는 입력 경로에서만 실행되므로, 마지막 입력 턴의 `purpose`를 언제 어떤 스테이지가 `SessionState`에 써넣을지(정책 엔진 §6-f 쪽 스테이지가 직접 쓰게 할지, `multiturn_stage`가 대신 받아쓸지)가 아직 안 정해졌다.
-
-**결정 필요한 것:**
-1. `purpose`를 `SessionState`에 넣을지, 아니면 별도의 작은 "세션 메타" 저장소를 새로 만들지
-2. 넣는다면 어느 스테이지가 쓰는지 (`purpose_policy_stage`가 직접 `store.save()`를 부르게 할지, `multiturn_stage`가 `ctx.purpose`를 읽어 같이 저장할지 — 후자가 스테이지 순서상 더 간단해 보임: `multiturn_stage`는 `purpose_policy_stage` *전*에 도는데, purpose는 `purpose_policy_stage`가 채우므로 실제로는 `multiturn_stage`가 저장 시점에 `ctx.purpose`를 아직 못 본다는 순서 문제가 있다 — 스테이지 순서를 바꾸거나, 별도의 저장 지점이 필요)
-3. 이건 output 경로 담당자와 조율이 필요한 사안이라 이 문서만으로 결정하지 않는다.
+책임 경계: `SessionState.purpose`는 "마지막 input 턴의 목적 스냅샷"일 뿐, 목적 분류 자체는 여전히
+§6-f 소관이다. `SessionState`가 e·f 상태를 같이 들고 있는 형태이긴 하나, 필드 하나 + 전용
+스테이지로 최소화했다.
 
 ---
 
-*Phase 2 구현·검증 완료 (§6 10/10). 남은 것: 세션 스토어 backend 확정(§7.3/§12), vault 만료 동반 정리 실연결(§5 #9), §7의 두 연관 버그, §8의 purpose 저장 방식 결정(output 경로 담당자와 조율).*
+*Phase 2 구현·검증 완료 (§6 10/10). 남은 것: 세션 스토어 backend 는 인메모리로 확정(§7.3/§12,
+아키텍처 §7.3·§8), §7 첫 번째 연관 버그(regex ACCOUNT/PHONE 충돌)는 b 튜닝 대기.*
