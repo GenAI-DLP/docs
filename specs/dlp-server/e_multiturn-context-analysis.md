@@ -4,187 +4,189 @@
 
 한 줄 정의: 세션 전체 대화를 추적해 여러 턴에 분산 입력된 PII 조합을 엔티티 그래프 + 슬라이딩 윈도우로 탐지하고 누적 위험도를 매긴다.
 
-담당 모듈: `context/store.py`, `context/accumulator.py`
+담당 모듈: `context/store.py`, `context/accumulator.py`, `context/stage.py`
 설계 의도·전체 맥락: `../../architecture/dlp-server-architecture.md` §6-e
 관련 스키마: `../../schemas/dlp-server/session-context.md`
 색인: `../spec-index.md`
+
+**구현 현황 [확정]:** `pipeline.py`의 `_INPUT_STAGES`에 `multiturn_stage`가 실제로 배선되어 있고, 로드맵 §9 Phase 2 검증 시나리오("N턴 분산 입력 → 3턴째 누적 위험도로 차단")를 실제 gRPC 요청 및 pytest 통합 테스트로 확인했다. 아래 문서는 스텁이 아니라 **동작하는 코드 기준**으로 작성됐다.
+
+---
+
+## 0. 모듈 구성
+
+| 파일 | 역할 |
+|---|---|
+| `context/store.py` | `SessionStore` 인터페이스 + `InMemorySessionStore`(TTL 스윕) |
+| `context/accumulator.py` | 엔티티 그래프·슬라이딩 윈도우·위험도 산정 순수 로직 |
+| `context/stage.py` | `pipeline.py`의 `Stage = Callable[[AnalysisContext], AnalysisContext]` 계약에 맞춘 어댑터. `accumulate()`를 감싸 sync/async 경계를 브리지 |
+
+`stage.py`가 별도 파일로 분리된 이유: `accumulator.accumulate()`는 `(state, spans, turn_index, config)`를 받는 순수 함수라 테스트하기 쉽지만, 파이프라인이 요구하는 `Stage` 시그니처(`ctx` 하나만 받음)와는 다르다. 어댑터를 분리해 두 계약을 섞지 않았다.
 
 ---
 
 ## 1. 입력 예시
 
-파이프라인 스테이지 4(세션 컨텍스트 누적, §3.1)가 이 모듈을 호출할 때 넘기는 입력이다.
+파이프라인 스테이지 [4](§3.1)가 `multiturn_stage(ctx: AnalysisContext) -> AnalysisContext` 형태로 호출된다. 내부적으로 세션을 로드하고 `accumulate()`를 호출한다.
 
-**store.py — 세션 로드**
-
-```
-SessionStore.load(session_id: str) -> SessionState | None
-```
-
-```json
-// 기존 세션 상태 (2턴째까지 누적된 상태, 3턴째 요청 직전)
-{
-  "session_id": "sess_8f2a...",
-  "created_at": "2026-09-03T09:12:01Z",
-  "expires_at": "2026-09-03T09:42:01Z",
-  "turn_count": 2,
-  "entities": [
-    {"type": "NAME", "value_hash": "a1b2...", "first_turn": 1, "last_turn": 1, "count": 1},
-    {"type": "RRN",  "value_hash": "c3d4...", "first_turn": 2, "last_turn": 2, "count": 1}
-  ],
-  "risk_score": 0.42
-}
+**stage.py 내부 — 세션 로드**
+```python
+state = await store.load(ctx.session_id)   # 없으면 store.new_session()
 ```
 
 **accumulator.py — 이번 턴 누적**
-
-```
-accumulate(state: SessionState, new_turn_spans: list[Span], turn_index: int) -> SessionState
+```python
+accumulate(state, ctx.new_turn_spans, turn_index=state.turn_count + 1, config=cfg)
 ```
 
 ```json
-// 이번 턴(3턴째)에 새로 탐지된 span
-{
-  "new_turn_spans": [
-    {"type": "ACCOUNT", "value": "110-***-******", "start": 12, "end": 24, "confidence": 0.93, "source": "regex"}
-  ],
-  "turn_index": 3
-}
+// ctx.new_turn_spans (pii_detect_stage 가 이미 채워둔 것, 이번 턴 탐지 결과만)
+[
+  {"type": "ACCOUNT", "value": "110-234-567890", "start": 5, "end": 19, "confidence": 0.65, "source": "regex"}
+]
 ```
 
-값 자체(`value`)는 누적기에 들어가는 순간 해시로 변환되며, 평문 값은 세션 상태에 저장하지 않는다(§7.2 감사 로그 원칙과 동일한 최소 보관 원칙 적용).
+값 자체(`value`)는 `accumulate()` 안에서 해시로 변환되어 세션 상태에 저장되고, 평문은 세션 상태에 남지 않는다.
 
 ---
 
 ## 2. 출력 예시
 
-**accumulator.py — 누적 결과**
+**stage.py 가 ctx 에 되써주는 것**
+```python
+ctx.risk_score = state.risk_score          # 0.0~1.0
+ctx.accumulated = {"ACCOUNT": [<이번 턴 Span>]}   # 이번 턴 span만 타입별로 묶음, §3.6 참고
+```
 
+**실제 gRPC 응답 예시 (검증 완료, action=transform)**
 ```json
 {
-  "session_id": "sess_8f2a...",
-  "turn_count": 3,
-  "entities": [
-    {"type": "NAME",    "value_hash": "a1b2...", "first_turn": 1, "last_turn": 1, "count": 1},
-    {"type": "RRN",     "value_hash": "c3d4...", "first_turn": 2, "last_turn": 2, "count": 1},
-    {"type": "ACCOUNT", "value_hash": "e5f6...", "first_turn": 3, "last_turn": 3, "count": 1}
-  ],
-  "entity_graph_edges": [
-    {"from": "NAME:a1b2", "to": "RRN:c3d4",     "co_occur_window": true},
-    {"from": "RRN:c3d4",  "to": "ACCOUNT:e5f6", "co_occur_window": true}
-  ],
-  "risk_score": 0.87,
-  "risk_delta_reason": [
-    "combo:NAME+RRN(+0.25)",
-    "combo:RRN+ACCOUNT(+0.20)",
-    "velocity: 3 turns / 40s (+0.05)"
-  ]
+  "verdict": "transform",
+  "provider": "gateway",
+  "purpose": "customer_support",
+  "risk_score": 0.0,
+  "guardrail_hits": []
 }
 ```
 
-**AnalysisContext 반영 (§5 계약 타입)**
-
+**3턴째 block 시 (실제 통합 테스트로 확인)**
 ```json
 {
-  "accumulated": { "NAME": [...], "RRN": [...], "ACCOUNT": [...] },
-  "risk_score": 0.87
+  "verdict": "block",
+  "risk_score": 0.65,
+  "note": "risk_hard_block"
 }
 ```
-
-**정책 엔진으로의 판정 트리거 (risk_overrides, §6-f)**
-
-```json
-{"action": "block", "reason_obj": {"trigger": "risk_score >= 0.8", "risk_score": 0.87, "stage": "multiturn_accumulator"}}
-```
+`note: risk_hard_block`은 `pipeline.py::_block_check()`가 `ctx.risk_score >= cfg.risk.hard_block`을 확인해서 붙이는 것이다 — `multiturn_stage`는 `ctx.blocked`를 세팅하지 않는다(§3.5).
 
 ---
 
-## 3. 판정 로직 (룰 / 프롬프트 / 임계값)
-
-[논의] 아래는 초안이며 Phase 2 착수 시 확정한다.
+## 3. 판정 로직
 
 ### 3.1 엔티티 그래프
-- 노드: `(type, value_hash)`. 같은 세션 내 동일 값은 동일 노드로 병합된다(count 증가, last_turn 갱신).
-- 엣지: 슬라이딩 윈도우 내에서 함께 언급된 두 노드 사이에 생성된다. 엣지 자체에 가중치를 두지 않고, 위험도 계산은 §3.3 조합 규칙표를 따른다.
-- 그래프는 세션 상태에 인메모리로만 유지하고 평문 값은 저장하지 않는다(해시만).
+- 노드: `(type, value_hash)`. 같은 세션 내 동일 값은 동일 노드로 병합(count 증가, last_turn 갱신).
+- 활성 윈도우(§3.2) 내 노드들 사이에 완전 그래프로 엣지를 만든다 (`_build_edges`).
 
 ### 3.2 슬라이딩 윈도우
-- 윈도우 크기 N턴(기본값 §4 참고)을 넘어간 엔티티는 그래프 신규 엣지 생성 대상에서 제외되지만, `entities` 누적 목록(전체 세션 이력)에서는 제거하지 않는다 — 위험도 계산의 "조합" 판정은 윈도우 기준, 감사·차단 이력 판정은 세션 전체 기준으로 이원화한다.
-- 근거: 대화가 길어지며 화제가 바뀐 뒤에도 초반 PII 조합을 계속 위험으로 잡으면 오탐이 누적되므로, "최근에 실제로 함께 쓰이려는 조합"만 그래프 위험도에 반영한다.
+- 기본 5턴 (`window_size_turns`, config 로 조정 가능, §4).
+- 조합/그래프 위험도는 **윈도우 내 활성 엔티티만** 사용. `entities` 이력 자체(세션 전체)는 윈도우 밖으로 나가도 지우지 않는다 — 재등장 시 `first_turn`을 새로 만들지 않기 위해서다(§5 엣지케이스).
 
-### 3.3 조합 위험도 규칙표 (초안)
-| 조합 | 가중치 | 비고 |
+### 3.3 조합 위험도 규칙표 [확정 — 코드 반영됨]
+
+| 조합 | 가중치 | 탐지 전제 |
 |---|---|---|
-| NAME + RRN | +0.25 | 신원 확정 조합 |
-| RRN + ACCOUNT | +0.20 | 금융 사기 활용 가능 조합 |
-| NAME + PHONE + ACCOUNT | +0.30 | 3종 조합 시 개별 합산이 아닌 별도 규칙으로 상한 부여 |
-| 동일 타입 반복 언급 (count ≥ 3) | +0.05 / 회 (최대 +0.15) | 같은 PII를 여러 번 되풀이 입력 |
-| 턴 속도(velocity): 짧은 시간에 다수 턴 | +0.05 ~ +0.10 | §3.4 참고 |
+| NAME + RRN | 0.25 | NAME은 `detect/dictionary.py`의 사전 등재 이름에 한해 탐지됨 |
+| NAME + RRN + ACCOUNT | 0.35 | 위와 동일 — 로드맵 §9 Phase 2 원 시나리오("이름·주민번호·계좌") |
+| NAME + PHONE + ACCOUNT | 0.30 | 위와 동일 |
+| RRN + ACCOUNT | 0.20 | 정규식만으로 탐지, 사전과 무관하게 항상 발동 |
+| RRN + ACCOUNT + PHONE | 0.35 | 정규식만으로 탐지 — 사전에 없는 이름이어도 이 조합으로 block 가능 |
 
-- 조합 규칙은 상한(cap)을 둔다 — 단순 합산이 1.0을 쉽게 넘겨 임계값의 변별력이 사라지는 것을 방지.
-- 규칙표는 `policy/policy.yaml`과 별개로 `context/` 설정에 둔다(정책 엔진의 목적×role 규칙과는 계층이 다름 — 이건 "이 세션이 얼마나 위험한 정보를 모으고 있는가"이고 정책 엔진은 "이 정보를 이 목적·role에 줘도 되는가").
+**왜 NAME 조합과 별개로 RRN 계열 조합을 뒀는가:** `detect/dictionary.py`는 Aho-Corasick 정확 일치 방식이라 사전에 없는 이름은 절대 못 잡는다. 현재 `financial_terms.txt`는 데모용 샘플(약 10개 항목, 실명 4명)이라 실제 이름 대부분이 커버 안 된다. NER(로드맵 Phase 5) 또는 실제 운영 사전(컴플라이언스팀 리스트)이 갖춰지기 전까지, `RRN+ACCOUNT+PHONE` 같은 정규식 전용 조합이 "이름이 사전에 없는 경우"의 보완 경로 역할을 한다.
 
-### 3.4 턴 간격·속도 신호
-- 짧은 시간에 여러 턴이 이어지며 서로 다른 타입의 PII가 연달아 들어오는 패턴("우회 분산 입력"의 전형)에 소폭 가중치를 더한다.
-- 순수 규칙: `turn_count >= 3 and elapsed_seconds <= 60` → `+0.05`, `turn_count >= 5 and elapsed_seconds <= 120` → `+0.10` (초안 수치, 튜닝 대상).
+- `combo_cap = 0.6` — 조합 가중치 총합의 상한. `cfg.risk.hard_block`(§4)과 **반드시 같은 값**이어야 한다. 이게 어긋나면(예: cap이 hard_block보다 낮음) 조합만으로는 절대 block에 도달할 수 없는 상태가 된다 — 실제로 이 버그를 겪었다 (`combo_cap=0.5`, `hard_block=0.8`이던 시기).
 
-### 3.5 임계값 처리
-- `risk_score >= BLOCK_THRESHOLD` (§6-f `risk_overrides`의 `risk_score >= 0.8`과 동일 값을 공유) → block.
-- block 미도달이어도 `risk_score`는 정책 엔진(§6-f)의 컨텍스트 입력으로 전달되어 엔티티별 조치 강도(mask vs tokenize vs block)에 영향을 준다 — accumulator는 직접 block하지 않고 위험도만 계산하며, 최종 action 결정은 정책 엔진이 한다는 원칙을 유지한다. 단, `risk_overrides`에 정의된 하드 컷오프(§6-f `policy.yaml`)는 예외적으로 accumulator 단계에서도 조기 종료(short-circuit) 가능하도록 열어둔다 — 성능·명확성 트레이드오프는 Phase 2에서 결정.
+### 3.4 반복 가중치
+- 동일 엔티티가 세션 내 3회 이상 언급되면 3회째부터 회당 `repeat_weight`(기본 0.05) 가산, `repeat_cap`(기본 0.15)으로 상한.
+
+### 3.5 속도(velocity) 가중치
+- `(최소 턴 수, 최대 경과 초, 가중치)` 튜플 목록. 기본값: `(3턴, 60초, +0.05)`, `(5턴, 120초, +0.10)`. 코드 상수로만 존재하며 config로 안 뺐다(§4 참고).
+
+### 3.6 `ctx.accumulated`의 의미 — [확정, 원래 계약 문서(§5)와 다르게 구현됨]
+`app/models.py`의 `AnalysisContext.accumulated: dict[str, list[Span]]` 주석은 "세션 누적 엔티티"라고 돼 있지만, 실제로는 **"이번 턴에 탐지된 span만 타입별로 묶은 것"**을 채운다. 이유:
+1. 세션 상태(`store.py`)는 평문 값을 저장하지 않으므로(§7.2 최소 보관 원칙) 과거 턴의 `Span.value`를 애초에 복원할 수 없다.
+2. 과거 턴의 `Span.start/end`는 현재 턴 본문(`ctx.turns[*].text`) 기준으로 무의미하다 — 변환 스테이지(`transform_stage`)가 실제로 고칠 수 있는 건 이번 턴 텍스트뿐이다.
+3. 세션 전체의 위험 정도는 `ctx.risk_score`로 충분히 전달된다.
+
+### 3.7 책임 경계 — accumulator는 block하지 않는다 [확정]
+`multiturn_stage`는 `ctx.risk_score`만 채우고 `ctx.blocked`는 세팅하지 않는다. block 판정은 `pipeline.py::_block_check()`가 스테이지 실행이 모두 끝난 뒤 `ctx.risk_score >= cfg.risk.hard_block`를 비교해서 내린다. 정책 엔진(§6-f)의 `risk_overrides`와는 별개의, 파이프라인 레벨의 최종 컷오프다.
 
 ---
 
-## 4. 파라미터 · 설정값
+## 4. 파라미터 · 설정값 [확정 — app/config.py에 반영됨]
 
-[논의] `context/config.yaml` (또는 전역 `config.yaml`의 하위 섹션) 초안.
+`app/config.py`의 `Config.multiturn`(`MultiturnConfig`)에서 다음 4개 스칼라만 온다:
 
-| 파라미터 | 기본값(초안) | 설명 |
+| 파라미터 | 기본값 | env |
 |---|---|---|
-| `window.size_turns` | 5 | 엔티티 그래프 엣지 생성에 사용하는 슬라이딩 윈도우 턴 수 |
-| `session.ttl_seconds` | 1800 (30분) | 세션 만료 시간. 만료 시 store + vault 함께 정리 |
-| `risk.block_threshold` | 0.8 | 누적 위험도 차단 임계값 (`policy.yaml`의 `risk_score >= 0.8`과 동일 값 유지) |
-| `risk.combo_weights` | §3.3 표 | 조합별 가중치 (엔티티 타입 쌍 → float) |
-| `risk.combo_cap` | 0.5 | 단일 판정에서 조합 가중치 합산 상한 |
-| `risk.repeat_weight` | 0.05 | 동일 엔티티 반복 언급 1회당 가중치 |
-| `risk.repeat_cap` | 0.15 | 반복 가중치 합산 상한 |
-| `velocity.thresholds` | §3.4 표 | (턴 수, 경과 시간) → 가중치 매핑 |
-| `store.backend` | `memory` | `memory` \| `postgres` — §7.3 미정 사항과 연동, 인터페이스 뒤에서 전환 |
-| `store.sweep_interval_seconds` | 300 | 인메모리 TTL 스윕 주기 |
+| `multiturn.window_size_turns` | 5 | `DLP_MULTITURN__WINDOW_SIZE_TURNS` |
+| `multiturn.combo_cap` | 0.6 | `DLP_MULTITURN__COMBO_CAP` |
+| `multiturn.repeat_weight` | 0.05 | `DLP_MULTITURN__REPEAT_WEIGHT` |
+| `multiturn.repeat_cap` | 0.15 | `DLP_MULTITURN__REPEAT_CAP` |
+| `risk.hard_block` (별도 섹션) | **0.6** | `DLP_RISK__HARD_BLOCK` |
+
+**`combo_weights`/`velocity_thresholds`는 의도적으로 config에서 뺐다.** 이유:
+- `combo_weights`의 키는 `frozenset[str]`인데, pydantic-settings의 env/yaml 오버라이드 메커니즘과 구조적으로 궁합이 안 좋다(중첩 컬렉션+비-JSON 키 타입).
+- "어떤 엔티티 조합에 얼마의 위험도를 줄지"는 운영 설정값이라기보다 탐지 정책에 가까운 판단이라, 코드 리뷰를 거쳐 `accumulator.py`를 직접 고치는 편이 안전하다고 판단했다.
+
+바꾸려면 `app/context/accumulator.py::AccumulatorConfig.combo_weights` / `velocity_thresholds`를 직접 수정한다.
+
+`store.backend`, `session.ttl_seconds` 등 세션 스토어 관련 설정은 아직 config로 연결 안 됨 — §7.3/§12 미결정 상태 그대로다 (아래 참고).
 
 ---
 
 ## 5. 엣지 케이스
 
-[논의] 구현 시 테스트 케이스(§6)로 구체화한다.
-
-1. **세션 만료 직후 요청 도착** — TTL이 막 지난 세션에 새 턴이 들어오면 신규 세션으로 취급할지, 잠시(grace period) 이전 상태를 이어받을지 결정 필요. 기본안: 신규 세션으로 취급(누적 위험도 초기화), vault는 별도 TTL로 관리되므로 영향 없음(§7.2).
-2. **동일 값, 다른 타입으로 오탐** — 같은 문자열이 정규식/사전/NER에서 서로 다른 타입으로 탐지되는 경우, 그래프 노드를 `(type, value_hash)`로 분리해 이중 계산되지 않게 병합 규칙(§6-b merge.py)과 일관성을 맞춘다.
-3. **동일 엔티티 반복이지만 다른 세션 문맥** — 같은 사람 이름이 상담 목적으로 반복 언급되는 정상 케이스(예: 상담원이 같은 고객명을 여러 번 부름)와 반출 시도용 반복 입력을 구분하기 어려움 — `repeat_weight`를 작게 두고 조합 가중치 위주로 판정하는 이유.
-4. **role/목적이 세션 중간에 바뀌는 경우** — 목적 분류(§6-f)는 턴별로 재평가되므로, 누적 위험도는 목적과 무관하게 세션 전체로 유지하되 최종 action은 그 턴의 목적·role로 정책 엔진이 재평가. 즉 위험도 누적과 접근 제어 판정을 분리.
-5. **윈도우 밖으로 밀려난 엔티티의 재등장** — 1턴에 나온 엔티티가 10턴 뒤 다시 언급되면 새 엣지로 취급(윈도우 기준)하되, `entities` 이력에는 이미 존재하므로 신규 first_turn을 만들지 않고 `last_turn`만 갱신.
-6. **세션 식별자 재사용/충돌** — 프록시의 세션 식별 우선순위(§2.3: 헤더 → 쿠키 → 원격 주소)가 원격 주소까지 내려가는 경우 서로 다른 사용자가 같은 session_id로 섞일 위험 — accumulator 레벨에서 막을 수 없으므로 문서화만 하고, 프록시 측 이슈로 별도 트래킹.
-7. **NER 지연으로 인한 부분 span 도착(후반 단계)** — NER이 편입되기 전(Phase 2)에는 정규식/사전 span만으로 누적하므로 문제 없으나, Phase 5에서 NER이 붙으면 같은 턴 내 span이 시차를 두고 도착할 수 있어 누적 시점 처리 필요(당장은 범위 밖으로 기록만).
-8. **value_hash 충돌** — 해시 함수 선택 시 충돌 가능성 고려(예: SHA-256 등 안전한 해시 사용을 전제, 별도 명시 필요).
-
----
-
-## 6. 테스트 케이스표
-
-[미정] 착수 시 `tests/test_accumulator.py`에 구체 케이스로 반영한다. 아래는 표 골격.
-
-| # | 시나리오 | 입력 턴 시퀀스 | 기대 risk_score 방향 | 기대 action |
-|---|---|---|---|---|
-| 1 | 단일 턴 단일 엔티티 | T1: RRN | 낮음 (조합 없음) | 정책 엔진 개별 판정 |
-| 2 | 2턴 분산 — 이름+주민번호 | T1: NAME / T2: RRN | combo 가중치 반영 상승 | risk 상승, 임계 미만이면 정책 엔진 판정 |
-| 3 | 3턴 분산 — 이름+주민번호+계좌 | T1: NAME / T2: RRN / T3: ACCOUNT | 임계값(0.8) 초과 | block |
-| 4 | 동일 엔티티 반복 (동일 세션) | T1~T4: 같은 RRN 반복 | repeat_weight만큼 소폭 상승, cap 이내 | 정책 엔진 판정 |
-| 5 | 윈도우 밖 재등장 | T1: NAME / T7: RRN (window=5) | 낮음 (엣지 미생성) | 정책 엔진 판정 |
-| 6 | 고속 다턴(velocity) | T1~T5: 5턴을 100초 내 입력, 서로 다른 타입 | velocity 가중치 추가 반영 | risk 상승 |
-| 7 | 세션 TTL 만료 후 재요청 | T1 이후 TTL 경과 → 새 요청 | 신규 세션으로 초기화 | 이전 이력 미반영 확인 |
-| 8 | 세션 삭제 시 vault 동반 정리 | 세션 만료 트리거 | — | vault 레코드 revoked/삭제 확인(§7.2) |
-| 9 | injection 동시 발생 | T1: 정상 PII / T2: 인젝션 패턴 적중 | risk_overrides(`injection.hit`) 우선 | block (accumulator 결과와 무관) |
-| 10 | 조합 상한(cap) 초과 시도 | T1~T6: 다수 조합 동시 성립 | combo_cap으로 상한 고정 확인 | risk_score가 cap 이상으로 튀지 않음 |
+1. **세션 만료 직후 요청 도착** — [확정] 신규 세션으로 취급, 누적 위험도 초기화. `InMemorySessionStore.load()`가 만료 확인 즉시 정리 후 `None` 반환 → `stage.py`가 `new_session()` 호출.
+2. **동일 값, 다른 타입 오탐** — [확정] 그래프 노드가 `(type, value_hash)`라 자연히 분리됨. `merge.py`의 병합 정책과 일관.
+3. **동일 엔티티 반복이지만 정상 문맥** — [확정] `repeat_weight`를 작게(0.05) 두고 `repeat_cap`(0.15)으로 상한 — 조합 위험도(최대 0.6) 대비 비중을 낮게 유지.
+4. **role/목적이 세션 중간에 바뀜** — [확정] 누적 위험도는 목적과 무관하게 세션 전체로 유지. 최종 action은 그 턴의 목적·role로 정책 엔진(§6-f)이 별도 재평가.
+5. **윈도우 밖으로 밀려난 엔티티의 재등장** — [확정] `entities` 이력은 세션 전체 기간 유지, 재등장 시 `first_turn`은 그대로, `last_turn`만 갱신. 테스트로 확인됨(§6 #5).
+6. **세션 식별자 재사용/충돌** — [미정] 프록시의 세션 식별 우선순위(§2.3)가 원격 주소까지 내려가면 서로 다른 사용자가 같은 `session_id`를 쓸 위험 — accumulator 레벨에서 막을 수 없다. 프록시 쪽 이슈로 별도 트래킹 필요.
+7. **NER 편입 전 span 도착 시차 (Phase 5)** — [미정] 아직 범위 밖.
+8. **`value_hash` 충돌** — [확정] SHA-256 앞 16바이트 사용 (`accumulator.hash_value`). 실질적 충돌 위험 낮음.
+9. **세션 만료 시 vault 미동반 정리** — [미정, 신규] `InMemorySessionStore`에 `on_expire` 콜백 자리는 있지만 `transform/vault.py`를 실제로 호출하는 코드가 아직 없다. 만료된 세션의 토큰이 vault에 그대로 남는다.
 
 ---
 
-*이 문서는 스텁에서 상세 스펙으로 전환하는 초안이다. §3~4의 수치·규칙은 Phase 2 구현 착수 및 `eval/datasets/multiturn/` 기반 튜닝 후 확정한다.*
+## 6. 테스트 케이스표 [부분 완료]
+
+`tests/test_context_smoke.py` + `tests/test_context_integration.py` 기준.
+
+| # | 시나리오 | 상태 | 파일 |
+|---|---|---|---|
+| 1 | 단일 턴 단일 엔티티 | [미정] | — |
+| 2 | 2턴 분산 (조합 미도달) | [미정] | — |
+| 3 | 3턴 분산 — 조합 임계 도달 | ✅ | `test_context_smoke.py::test_case3_combo_triggers_threshold` |
+| 4 | 동일 엔티티 반복 (cap 적용) | ✅ | `test_context_smoke.py::test_case4_repeat_capped` |
+| 5 | 윈도우 밖 재등장 (first_turn 유지) | ✅ | `test_context_smoke.py::test_case5_window_reentry_no_new_first_turn` |
+| 6 | 고속 다턴 (velocity 가중치) | ✅ | `test_context_smoke.py::test_case6_velocity` |
+| 7 | 세션 TTL 만료 후 초기화 | ✅ | `test_context_smoke.py::test_case7_ttl_expiry_resets_session` |
+| 8 | 세션 만료 시 vault 동반 정리 | [미정] | 엣지케이스 9번과 동일 사유로 보류 |
+| 9 | injection 동시 발생 시 override 우선 | [미정] | — (정책 엔진 §6-f 영역과 겹침, 통합 테스트 필요) |
+| 10 | 조합 상한(cap) 초과 방지 | [확정, 간접 검증] | #3에서 `combo_cap` 자체를 검증하지만 "초과 시도"를 명시적으로 만드는 케이스는 아직 없음 |
+| — | **설정 배선** (`configure()` 없이 `app.config`에서 정상 로드) | ✅ | `test_context_smoke.py::test_default_config_loads_from_app_config_without_explicit_configure` |
+| — | **실제 파이프라인 E2E** — 3턴 분산 → block (사전 등재 이름) | ✅ | `test_context_integration.py::test_three_turn_distributed_input_triggers_block` |
+| — | **실제 파이프라인 E2E** — 정규식 전용 조합 → block (사전 미등재 이름) | ✅ | `test_context_integration.py::test_regex_only_combo_triggers_block_without_dictionary_name` |
+
+---
+
+## 7. 연관 이슈 (이 기능 검증 중 발견, 별도 담당 필요)
+
+이 스펙의 스코프는 아니지만 e2e 검증 과정에서 실제로 재현된 버그라 기록해둔다.
+
+- **`detect/regex_rules.py`**: `_ACCOUNT_PATTERN`과 `_PHONE_PATTERN`이 `010-1234-5678` 같은 값에서 동시에 매치되어 `merge.py`가 타입 충돌 경고를 낸다. 어느 쪽이 최종 채택될지가 우연에 가깝다 (source 우선순위 동점 시 먼저 탐지된 쪽).
+- **`transform/vault.py`**: `token_vault.session_id` 컬럼이 UUID 타입인데, 실제 `session_id`는 프록시가 헤더/쿠키/원격주소에서 뽑은 임의 문자열(§2.3)이라 UUID 형식이 보장 안 된다. `session_id`가 UUID가 아니면 `tokenize()`가 `InvalidTextRepresentation`으로 실패하고 `transform_stage`가 `redact`로 폴백한다 (겉으로는 안 터지지만 tokenize가 사실상 항상 실패하는 상태로 방치될 수 있음).
+
+---
+
+*Phase 2 구현·검증 완료. 남은 것: 위 §6의 [미정] 테스트 케이스, 세션 스토어 backend 확정(§7.3/§12), vault 만료 동반 정리(§5 #9), 그리고 §7의 두 연관 버그.*
