@@ -25,7 +25,7 @@
 [dlp-proxy-server]  SNI allowlist → 대상만 TLS 종단(MITM) → HTTP 파싱
    │  gRPC  Inspect(InspectRequest, direction="input")   ── 트래픽 Hold
    ▼
-[dlp-server]  입력 파이프라인 (Guard → 멀티턴 → 탐지 → 목적·정책 → 변환)
+[dlp-server]  입력 파이프라인 (Input Guard → 탐지 → 멀티턴 → 목적·정책 → 변환)
    │  Verdict(allow | block | transform)
    ▼
 [dlp-proxy-server]  판정대로 외부 LLM에 중계
@@ -35,7 +35,7 @@
    ▼
 [dlp-proxy-server]  다시 Hold → gRPC Inspect(direction="output")
    ▼
-[dlp-server]  출력 파이프라인 (detokenize → Output Guard → 재조립)
+[dlp-server]  출력 파이프라인 (Output Guard 재스캔 → detokenize → 재조립)
    │  Verdict
    ▼
 [dlp-proxy-server] → [직원 PC]

@@ -111,13 +111,13 @@ Go 프록시와 dlp-server는 하나의 protobuf 계약을 공유한다. 이 계
 ```
                      ┌──────────── 공용 엔진 (PII 탐지 · 정책) ────────────┐
                      │                                                    │
-[수신] → [Input Guard] → [멀티턴 분석] → [하이브리드 PII 탐지] ────────────┤
+[수신] → [Input Guard] → [하이브리드 PII 탐지] → [멀티턴 분석] ────────────┤
                      │                                                    │
                      │                  [목적 분석 + 정책 엔진]  ◀─────────┘
                      │                          │
                      │                  [동적 변환 + 토큰화] → 본문 재조립 → (프록시가 업스트림 중계)
                      │
-   (응답)  [Output Guard] : detokenize → PII 재검사 → 정책 위반 필터 → 응답 본문 재조립
+   (응답)  [Output Guard] : PII 재검사 → detokenize → 정책 위반 필터 → 응답 본문 재조립
                      │
                   [구조화 감사 로그]
 ```
@@ -126,21 +126,27 @@ Go 프록시와 dlp-server는 하나의 protobuf 계약을 공유한다. 이 계
 
 1. **어댑터 선택** — 본문 형식(사내 Gateway / OpenAI / Anthropic)을 판별해 대화 턴을 추출
 2. **Input Guard** — 프롬프트 인젝션·탈옥·명시적 반출 요청 탐지. 적중 시 즉시 `block`
-3. **하이브리드 PII 탐지** — 정규식/체크섬 + 사전 + NER 병렬 실행 후 병합
+3. **하이브리드 PII 탐지** — 정규식/체크섬 + 사전 + NER 실행 후 병합
 4. **세션 컨텍스트 누적** — 세션 스토어 로드 → 이번 턴 엔티티 누적 → 누적 위험도 갱신 → 저장
 5. **목적 분석** — 요청 목적 분류 (규칙 기반, 필요 시 모델 기반)
 6. **정책 엔진** — `(목적 × role × 엔티티 타입 × 누적 위험도)` → 엔티티별 조치 결정
+   - 분류된 목적은 세션 스토어에도 기록한다(`remember_purpose_stage`). 출력 경로 detokenize 가
+     이 값을 읽어 토큰 복원 인가를 판단한다(§3.2).
 7. **동적 변환** — 결정된 조치 실행(마스킹/일반화/집계/토큰화/합성/삭제/차단), 본문 재조립
 8. **감사 로그 기록**
 
 ### 3.2 출력 경로 스테이지 순서
 
 1. **응답 파싱** — 어댑터가 응답 본문(SSE 조각 포함)을 조립
-2. **detokenize** — 요청자 role·목적이 토큰의 접근 범위를 통과하면 원본 복원
-3. **Output Guard** — 모델이 새로 생성한 타인 PII 재스캔, 인젝션 순응 여부, 정책 위반 필터. 필요 시 재마스킹 또는 `block`
+2. **Output Guard** — 모델이 새로 생성한 타인 PII 재스캔(재마스킹), 인젝션 순응 여부. 필요 시 `block`
+3. **detokenize** — 요청자 role·목적이 토큰의 접근 범위를 통과하면 원본 복원.
+   목적은 입력 경로가 세션에 기록해둔 값을 조회한다(§3.1)
 4. **응답 본문 재조립**, 감사 로그 기록
 
-입력 [2~7]과 출력 [3]은 **동일한 탐지 엔진과 정책 엔진을 재사용**하며, 임계값·정책만 방향별로 다르게 준다.
+재스캔이 detokenize 앞에 오는 이유: 토큰 라벨 `<PII:…>` 은 정규식에 안 걸리므로 이 시점에 잡히는
+건 모델이 새로 만든 PII 뿐이다. detokenize 뒤에 재스캔하면 복원된 인가 PII 까지 다시 가려버린다.
+
+입력 [3]과 출력 [2]는 **동일한 탐지 엔진을 재사용**하며, 임계값만 방향별로 다르게 준다.
 
 ---
 
@@ -160,7 +166,8 @@ dlp-server/
 │   ├── api.py                    # 얇은 어댑터: /health, /events(대시보드), 평가 스크립트 진입점
 │   │
 │   ├── pipeline.py               # [핵심] analyze() 단일 진입점 — gRPC · HTTP · 평가 스크립트가 모두 재사용
-│   ├── models.py                 # [핵심] 계약 타입 (Turn / Span / AnalysisContext / Decision)
+│   ├── models.py                 # [핵심] 계약 타입 (Turn / Span / AnalysisContext / Decision) + WIRE/TRANSFORM_ACTIONS 상수
+│   ├── ids.py                    # session_id → 결정론적 UUID (감사·볼트 저장 계층 공용)
 │   ├── config.py / config.yaml   # 런타임 설정 (분류기 backend, 임계값, 장애 정책 등)
 │   │
 │   ├── adapters/                 # 본문 형식 파서 (인프라). 입력·출력 양방향 재사용
@@ -172,7 +179,7 @@ dlp-server/
 │   ├── detect/                   # 하이브리드 PII 탐지. 입력·출력 양방향 재사용
 │   │   ├── regex_rules.py        # 정규식 / 체크섬 (주민번호, 카드 Luhn, 계좌, 전화, 이메일, 여권, 운전면허, 사업자번호)
 │   │   ├── dictionary.py         # 사전 매칭 — Aho-Corasick (직원명단 / VIP / 내부 프로젝트명)
-│   │   ├── ner.py                # 한국어 NER (경량 모델, CPU) — 후반 단계 편입
+│   │   ├── ner.py                # GLiNER 제로샷 NER (gliner_multi-v2.1, CPU, Apache-2.0) — main.py 에서 preload
 │   │   └── merge.py              # span 중복 제거 / 신뢰도 융합 / 우선순위 (Output Guard도 재사용)
 │   │
 │   ├── guardrail/
@@ -180,8 +187,9 @@ dlp-server/
 │   │   └── output_check.py       # Output Guard: 타인 PII 재생성 / 인젝션 순응 / 정책 위반
 │   │
 │   ├── context/                  # 멀티턴 분석. 향후 행동 시퀀스 분석도 이 인프라 재사용
-│   │   ├── store.py              # SessionStore 인터페이스 + InMemory(TTL) / 외부 스토어 구현
-│   │   └── accumulator.py        # 턴별 엔티티 누적 — 엔티티 그래프 + 슬라이딩 윈도우, 누적 위험도 가중
+│   │   ├── store.py              # SessionStore 인터페이스 + InMemory(TTL 스윕). 데모 기본값
+│   │   ├── accumulator.py        # 턴별 엔티티 누적 — 엔티티 그래프 + 슬라이딩 윈도우, 누적 위험도 가중
+│   │   └── stage.py              # Stage 계약 어댑터 — multiturn_stage / remember_purpose_stage / get_last_purpose
 │   │
 │   ├── purpose/
 │   │   ├── classifier.py         # 목적 분류 — 규칙 기반 기본 / 모델 기반 드롭인 (교체 가능한 인터페이스)
@@ -256,16 +264,21 @@ class InjectionVerdict:
     pattern: str | None
 
 @dataclass
-class AnalysisContext:                   # 탐지 단계 산출물
+class AnalysisContext:                   # 스테이지 간 전달 객체 (탐지·판정 산출물 누적)
     session_id: str
     direction: str                      # input | output
     provider: str                       # gateway | openai | anthropic
-    role: str | None                    # role_resolver 결과 (접근 제어 축)
+    role: str | None                    # role_resolver 결과 (접근 제어 축). 파이프라인이 ctx 생성 시 채운다
     turns: list[Turn]
-    new_turn_spans: list[Span]
-    accumulated: dict[str, list[Span]]  # 세션 누적 엔티티 (멀티턴)
-    risk_score: float                   # 0.0 ~ 1.0
-    injection: InjectionVerdict
+    new_turn_spans: list[Span]          # [3] 탐지
+    accumulated: dict[str, list[Span]]  # [4] 멀티턴 — "이번 턴 span 을 타입별로 묶은 것" (구현 상세는 e 스펙 §3.6)
+    risk_score: float                   # [4] 멀티턴. 0.0 ~ 1.0
+    injection: InjectionVerdict         # [2] Input Guard
+    blocked: bool                       # 스테이지가 차단 요청. _run_stages 가 이후 스테이지 스킵
+    block_reason: dict | None           # blocked 근거. guardrail_hits 한 조각 형태 {"type": ...}
+    purpose: str | None                 # [5] 목적 분류 결과 (purpose_ref 코드)
+    purpose_confidence: float | None
+    span_actions: list[tuple[Span, str]]  # [5] 결정 (span, action). action 은 TRANSFORM_ACTIONS 중 하나. g 가 실행
 
 @dataclass
 class Decision:                          # 판정 단계 산출물 → gRPC Verdict
@@ -273,6 +286,10 @@ class Decision:                          # 판정 단계 산출물 → gRPC Verd
     transformed_body: bytes | None
     reason_obj: dict                    # 세부 변환 종류 · 근거 · 매칭 엔티티 요약 → Verdict.reason
 ```
+
+`models.py` 는 상수 두 개도 노출한다: `WIRE_ACTIONS = ("allow", "block", "transform")`
+(gRPC `Verdict.action`), `TRANSFORM_ACTIONS = ("keep", "mask", "generalize", "aggregate",
+"tokenize", "synthetic", "redact", "block")` (`span_actions` 의 action 값, `action_type` ENUM 과 일치).
 
 **어댑터 프로토콜** (`adapters/base.py`): `matches`, `extract_turns`, `rebuild`,
 `parse_response`, `rebuild_response`. 본문 바이트에서 대화 메시지 배열을 꺼내고 다시 조립하는
@@ -305,7 +322,11 @@ class Decision:                          # 판정 단계 산출물 → gRPC Verd
 2. **사전 / 화이트리스트:** 정규식으로 못 잡는 사내 특화 용어(직원 명단, VIP 고객, 내부
    프로젝트명). Aho-Corasick 다중 패턴 매칭.
 3. **NER (모델):** 사람 이름, 주소, 비정형 조직명, 비정형 신용정보(연체·대출잔액·신용등급 등).
-   경량 한국어 모델을 CPU로 서빙하며 지연이 크므로 캐싱·배치를 적용한다. 후반 단계에 편입한다.
+   **GLiNER 제로샷 NER**(`urchade/gliner_multi-v2.1`, 다국어, Apache-2.0)를 CPU로 서빙한다.
+   `app/main.py` 부트스트랩에서 모델을 preload 하고, 실패해도 부팅은 막지 않으며 첫 요청에서
+   lazy-load 를 재시도한다. 모델명·threshold 는 `app/config.py` 의 `DetectConfig` 로 주입한다
+   (`ner_model_name`, `ner_threshold` 기본 0.55). **라이선스 제약:** Apache-2.0 유지가 조건이라
+   상용 전환 시에도 `gliner_ko`(CC-BY-NC-4.0)로 교체하지 않는다 — 대안은 §12.
 
 **병합:** 동일 구간이 겹치면 우선순위(정규식 > 사전 > NER)로 신뢰도를 조정하고,
 `(start, end, type, confidence, source)` 리스트를 컨텍스트에 저장한다.
@@ -331,8 +352,12 @@ dlp-server가 MCP 클라이언트와 MCP 서버 사이의 프록시를 겸한다
 - **`accumulator.py`:** 턴별 고유 엔티티를 누적하고, **엔티티 그래프**(턴 간 언급된 엔티티 연결)와
   **슬라이딩 윈도우**(최근 N턴)를 함께 사용한다. 조합 위험도를 가중한다(예: 이름 + 주민번호가
   함께 누적되면 위험도 상승, 여기에 계좌번호가 더해지면 추가 상승). 턴 간격·속도 신호도 반영한다.
-- 매 턴 `load → accumulate → save`를 수행하고, 누적 위험도가 임계값을 넘으면 `block`한다.
-  세션 TTL 만료 시 해당 세션의 vault도 함께 정리한다.
+- **`stage.py`:** `pipeline.py` 의 `Stage` 계약에 맞춘 어댑터. 매 턴 `load → accumulate → save`
+  후 `ctx.risk_score`·`ctx.accumulated` 를 갱신한다. `multiturn_stage` 자체는 `ctx.blocked` 를
+  세팅하지 않고, 파이프라인이 `risk_score >= risk.hard_block`(기본 0.6)일 때 `block` 한다.
+  분류된 목적을 세션에 기록하는 `remember_purpose_stage`(출력 경로 detokenize 가 조회)도 여기 있다.
+- 세션 스토어는 데모에서 **인메모리(TTL 스윕)** 로 확정했다(§7.3, §8). 세션 만료 시
+  `InMemorySessionStore` 의 `on_expire` 훅이 해당 세션 vault 레코드를 soft revoke 한다.
 
 ### f. 목적 기반 동적 데이터 접근 제어 — `purpose/`, `policy/`
 
@@ -433,9 +458,12 @@ risk_overrides:
 볼트의 `cipher_value` 는 앱레벨 AES-GCM으로 암호화하며, 키는 dlp-server 설정(env)에 두고
 저장소에는 두지 않는다. KMS 연동은 이후 확장이다.
 
-**세션 스토어(운영 3테이블)는 미정** — 인메모리(TTL 스윕) 또는 PostgreSQL(`sessions` /
-`session_entities`). `context/store.py` 의 `SessionStore` 인터페이스 뒤에 두고 멀티턴(e) 착수
-시점에 확정한다. 어느 쪽이든 볼트·감사는 세션과 FK가 없어 영향받지 않는다.
+**세션 스토어(운영 3테이블)는 데모에서 인메모리(TTL 스윕)로 확정** — `context/store.py` 의
+`InMemorySessionStore`. `SessionState`(세션별 엔티티 그래프·슬라이딩 윈도우·누적 위험도·마지막
+목적)는 프로세스 메모리에만 있고 재시작 시 사라진다. `sessions` / `session_turns` /
+`session_entities` PostgreSQL 테이블은 스키마에는 있으나 현재 코드가 쓰지 않는다(다중 프로세스·
+영속 배포로 갈 때의 확장 경로). `SessionStore` 프로토콜 뒤라 교체해도 상위 파이프라인은 영향
+없다. 어느 쪽이든 볼트·감사는 세션과 FK가 없어 영향받지 않는다.
 
 네 개 데이터 계약의 단일 기준은 [`../schemas/dlp-server/postgres-schema.sql`](../schemas/dlp-server/postgres-schema.sql)
 이며(계약별 설명은 [`../schemas/`](../schemas/) 하위 문서).
@@ -446,7 +474,7 @@ risk_overrides:
 
 | 영역 | 데모 범위 (현재 구현) | 프로덕션 확장 방향 |
 |---|---|---|
-| 세션 스토어 | 인메모리(TTL 스윕) 또는 PostgreSQL — **미정** | 외부 인메모리 스토어(Redis 등) |
+| 세션 스토어 | 인메모리(TTL 스윕) — **확정**. PG `sessions*` 테이블은 미사용 | 외부 인메모리 스토어(Redis 등) 또는 PG `sessions*` 배선 |
 | 토큰 볼트 | PostgreSQL(`token_vault`) + 앱레벨 AES-GCM + 접근 범위 게이팅 | KMS 키 연동, 형식 보존 암호화(FPE) 병행 |
 | 토큰화 방식 | 결정론적 플레이스홀더 `<PII:TYPE:n>` | 형식 보존 암호화(FPE) 병행 |
 | 정책 엔진 | PostgreSQL(`policy_*`) + 경량 룰 평가기 (시드 `policy.yaml`) | 외부 정책 엔진(OPA/Rego), 관리자 API CRUD |
@@ -463,39 +491,51 @@ risk_overrides:
 파이프라인 코어(`analyze()`)부터 만들고, 전송 계층 껍데기는 마지막에 붙인다. 각 단계는 검증
 마일스톤으로 끝난다.
 
+> **진행 현황(2026-09 기준):** Phase 0~3 완료, Phase 4 대체로 완료, Phase 5 진행 중
+> (`/events`·대시보드는 데모 0), Phase 6 미착수. 아래 각 Phase 머리에 상태를 표기.
+
 ### Phase 0 — 스캐폴딩
+**상태: ✅ 완료** (#2)
 레포 생성, `dlp.proto` 연결 및 코드 생성, `models.py` 계약 타입 확정,
 `pipeline.analyze()` 스켈레톤(항상 `allow` 반환), gRPC 서버와 `/health`.
 **검증:** 프록시가 붙어 `allow` 판정을 수신 → 관통 확인.
 
 ### Phase 1 — 탐지 + 토큰화 (입력 경로 E2E)
+**상태: ✅ 완료** (#9 DB 인프라, #12 볼트, #15/#16 탐지 레이어, #20 변환)
 PostgreSQL 스키마 적용(`postgres-schema.sql`), 사내 Gateway 어댑터, 정규식 탐지, 사전 탐지, 병합,
 PostgreSQL 볼트(`token_vault`, 앱레벨 AES-GCM), 기본 변환(keep/mask/redact/tokenize).
 파이프라인은 입력에서 `탐지 → 전부 토큰화 → 재조립 → transform 반환`.
 **검증:** Gateway 요청의 주민번호가 토큰으로 치환되어 업스트림에 전달되고, 프록시가 치환 본문을 사용.
 
 ### Phase 2 — 세션 컨텍스트 + 멀티턴
+**상태: ✅ 완료** — `multiturn_stage` 배선 + E2E 검증(e 스펙 §6). 세션 스토어는 인메모리 확정(§7.3)
 `SessionStore`(인메모리 TTL)와 누적기(엔티티 누적, 위험도 가중). 매 턴 로드/누적/저장,
 누적 위험도가 임계값을 넘으면 `block`.
 **검증:** 이름·주민번호·계좌를 3턴에 나누어 입력 → 3턴째 누적 위험도로 차단.
 
 ### Phase 3 — 출력 경로 + 가드레일
+**상태: ✅ 완료** (#13 Input Guard) — 출력 경로 `_OUTPUT_STAGES = [output_guard, detokenize_stage]`
 Input Guard(패턴 룰)와 Output Guard(타인 PII 재생성 / 인젝션 순응 / 정책 위반). 출력 파이프라인은
-`응답 파싱 → detokenize → Output Guard → 재조립`. 입력 파이프라인 초입에 인젝션 체크 추가.
+`응답 파싱 → Output Guard(재스캔) → detokenize → 재조립`. 입력 파이프라인 초입에 인젝션 체크 추가.
 **검증:** 인젝션 요청 차단, 응답의 토큰이 원본으로 복원되어 사용자에게 표시.
 
 ### Phase 4 — 목적 분석 + 정책 엔진
+**상태: ✅ 대체로 완료** (#17/#18 목적·정책, #20 변환) — mask/redact/tokenize/generalize(RRN)/
+aggregate/synthetic 동작. 남음: `access_scope` 정책화(`policy_rules` +restore 컬럼), span↔turn 매핑
 규칙 기반 목적 분류기, role 해석기, PostgreSQL `policy_*` 테이블(시드 `policy.yaml`) + 정책 엔진,
 변환에 generalize/aggregate 추가.
 파이프라인은 `목적 → 정책 평가 → 엔티티별 조치 → 변환 실행`.
 **검증:** 같은 PII라도 목적이 "요약"이면 토큰화, "코딩 지원"이면 차단.
 
 ### Phase 5 — 로깅 + 대시보드 + NER
+**상태: 🚧 진행 중** — PostgreSQL `log_events` sink · GLiNER NER 통합·병합 편입 완료.
+`/events` 엔드포인트와 관리자 대시보드는 데모 0 에서 착수.
 구조화 감사 로그를 PostgreSQL `log_events` 로 정착(스테이지 판정 수렴), `/events` 엔드포인트
 (대시보드 tail), 한국어 NER 통합 및 병합 편입, 임계값 튜닝.
 **검증:** 대시보드에 세션별 탐지·목적·조치·지연이 실시간 표시되고 원문이 노출되지 않음.
 
 ### Phase 6 — 성능 평가 + 레드팀
+**상태: ⬜ 미착수** — `eval/run_eval.py` 골격만 존재
 평가 데이터셋 구성(정상 / 공격 / 멀티턴), `run_eval.py`가 두 모드를 실행 —
 **baseline**(정규식 탐지 시 무조건 차단, 기존 DLP 모사)과 **full**(전체 파이프라인). 지표는
 탐지율(Detection Rate), 오탐률(False Positive Rate), 평균·95퍼센타일 지연. baseline과 full을
@@ -529,11 +569,12 @@ Input Guard(패턴 룰)와 Output Guard(타인 PII 재생성 / 인젝션 순응 
 | 항목 | 현재 방향 | 상태 |
 |---|---|---|
 | 전송 계층 최종안 (gRPC / REST) | 코어 `analyze()`부터. gRPC를 얇게 유지하는 방향, Phase 0 말에 확정 | [논의] |
-| 모델 사용 범위 (목적 분류 / Input Guard / Output Guard) | 인터페이스 뒤에 규칙 기반을 기본으로, 후반 단계에 무중단 교체 | [논의] |
+| 모델 사용 범위 (목적 분류 / Input Guard / Output Guard) | 셋 다 **규칙 기반으로 확정** (모델 교체 seam 유지). NER 은 GLiNER(`gliner_multi-v2.1`) 사용 중 | [일부 확정] |
+| NER 모델 라이선스 | `gliner_multi-v2.1` = Apache-2.0. 한국어 특화 `gliner_ko` 는 CC-BY-NC-4.0 (상용 불가) → 교체하지 않고, 필요 시 자체 파인튜닝 | [확정] |
 | provider 페이로드 변동 대응 | 실서비스 웹 UI 대신 공식 API 포맷과 사내 Gateway 포맷을 우선 타깃 | [논의] |
 | 목적 확보 경로 | 명시 파라미터가 MITM 경로에 맞지 않음 → Gateway가 목적·role 힌트를 헤더로 주입하는 전제 필요 | [논의] |
 | 엔티티 타입 / 목적 최종 목록 | 조회 테이블 seed로 시작, 확정 시 행 추가. 코드와 DB 중 하나를 단일 기준으로 | [미정] |
-| 외부 세션 스토어(Redis 등) 도입 여부 | 인메모리로 데모를 커버할 수 있는지 Phase 2에서 판단 | [미정] |
+| 외부 세션 스토어(Redis 등) 도입 여부 | 데모는 **인메모리(TTL 스윕)로 확정**(§7.3). Redis/PG `sessions*` 는 다중 프로세스·영속 배포 시 | [데모 확정] |
 | 토큰 접근 범위(access scope)의 정책 소스 | vault 레코드에 고정할지, 복원 시점에 정책 엔진이 재평가할지 | [미정] |
 | 스트리밍 홀드 범위 / QUIC 대응 | 현재 범위 밖, 확장 방향으로만 기록 | [미정] |
 
