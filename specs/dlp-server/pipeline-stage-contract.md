@@ -50,14 +50,17 @@ Stage = Callable[[AnalysisContext], AnalysisContext]
 | `session_id` | `str` | 파이프라인 | 프록시가 넘긴 값 |
 | `direction` | `str` | 파이프라인 | `input` / `output` |
 | `provider` | `str` | 파이프라인 | 어댑터 판별 결과 (`gateway` …) |
-| `role` | `str \| None` | [5] 목적+정책 (f) | `role_resolver` 결과. 초기값 `None` |
+| `role` | `str \| None` | 파이프라인 (`_analyze_input`/`_analyze_output` 이 ctx 생성 시 `role_resolver.resolve(headers)`) | 접근 제어 축. 초기값 `None` |
 | `turns` | `list[Turn]` | 파이프라인(어댑터) | 요청/응답 본문에서 추출한 대화 턴 |
 | `new_turn_spans` | `list[Span]` | [3] PII 탐지 (b) | 이번 턴에서 탐지된 엔티티. 초기값 `[]` |
-| `accumulated` | `dict[str, list[Span]]` | [4] 멀티턴 (e) | 세션 누적 엔티티. 초기값 `{}` |
+| `accumulated` | `dict[str, list[Span]]` | [4] 멀티턴 (e) | "이번 턴 span 을 타입별로 묶은 것" (구현 상세는 e 스펙 §3.6). 초기값 `{}` |
 | `risk_score` | `float` | [4] 멀티턴 (e) | `0.0 ~ 1.0`. 초기값 `0.0` |
 | `injection` | `InjectionVerdict` | [2] Input Guard (c) | `hit` / `score` / `pattern`. 초기값 `hit=False` |
 | `blocked` | `bool` | 아무 스테이지 | injection/risk 외 사유로 차단 요청. 초기값 `False` |
 | `block_reason` | `dict \| None` | 아무 스테이지 | `blocked` 시 근거. `guardrail_hits` 한 조각 형태 `{"type": "..."}`. 초기값 `None` |
+| `purpose` | `str \| None` | [5] 목적+정책 (f) | 목적 분류 결과 (`purpose_ref` 코드). 초기값 `None` |
+| `purpose_confidence` | `float \| None` | [5] 목적+정책 (f) | 초기값 `None` |
+| `span_actions` | `list[tuple[Span, str]]` | [5] 목적+정책 (f) | `(span, action)` — action 은 `TRANSFORM_ACTIONS` 중 하나. g 가 실행. 초기값 `[]` |
 
 **본문 변경**은 `ctx.turns[i].text` 를 수정하는 방식으로 한다. 파이프라인이 이후 어댑터로 재조립한다 (§5).
 
@@ -78,23 +81,32 @@ _OUTPUT_STAGES: list[Stage] = [ ... ]
 
 [`../../architecture/dlp-server-architecture.md`](../../architecture/dlp-server-architecture.md) §3.1 번호 목록을 따른다.
 
-| # | 스테이지 | 기능 | 채우는 `ctx` 필드 |
+실제 배선(`app/pipeline.py`):
+`_INPUT_STAGES = [injection_guard, pii_detect_stage, multiturn_stage, purpose_policy_stage,
+remember_purpose_stage, transform_stage]`
+
+| # | 스테이지 (함수) | 기능 | 채우는 `ctx` 필드 |
 |---|---|---|---|
 | 1 | 어댑터 선택 + 턴 추출 | 인프라 | `turns` (파이프라인이 수행) |
-| 2 | Input Guard | c | `injection` |
-| 3 | 하이브리드 PII 탐지 | b | `new_turn_spans` (`detect.run(text) -> list[Span]`) |
-| 4 | 세션 컨텍스트 누적 (멀티턴) | e | `accumulated`, `risk_score` |
-| 5 | 목적 분석 + 정책 엔진 | f | `role`, 엔티티별 조치 결정 |
-| 6 | 동적 변환 + 토큰화 | g, a | `turns[*].text` |
+| 2 | `injection_guard` | c | `injection` (적중 시 `blocked` + `block_reason`) |
+| 3 | `pii_detect_stage` | b | `new_turn_spans` (`app.detect.detect(text) -> list[Span]`) |
+| 4 | `multiturn_stage` | e | `accumulated`, `risk_score` |
+| 5 | `purpose_policy_stage` | f | `purpose`, `purpose_confidence`, `span_actions` (`block` action → `blocked`) |
+| 5.5 | `remember_purpose_stage` | e | (세션 스토어에 `purpose` 기록 — 출력 경로 detokenize 가 조회) |
+| 6 | `transform_stage` | g, a | `turns[*].text` |
 | 7 | 본문 재조립 + 감사 로그 | 인프라 | (파이프라인이 수행) |
 
 ### 4.2 output 경로 순서
 
-| # | 스테이지 | 기능 |
+실제 배선: `_OUTPUT_STAGES = [output_guard, detokenize_stage]` — **Output Guard 가 detokenize 앞.**
+토큰 라벨 `<PII:…>` 은 정규식에 안 걸리므로, 재스캔이 잡는 건 모델이 새로 만든 PII 뿐이다.
+detokenize 뒤에 재스캔하면 복원된 인가 PII 까지 다시 가려버린다.
+
+| # | 스테이지 (함수) | 기능 |
 |---|---|---|
 | 1 | 응답 파싱 (`parse_response`) | 인프라 |
-| 2 | detokenize (인가 검사) | a |
-| 3 | Output Guard | c |
+| 2 | `output_guard` (타인 PII 재스캔·재마스킹 + 인젝션 순응 → `block`) | c |
+| 3 | `detokenize_stage` (인가 검사 후 복원. purpose 는 `get_last_purpose()` 조회) | a |
 | 4 | 본문 재조립 + 감사 로그 | 인프라 |
 
 ---
@@ -106,7 +118,7 @@ _OUTPUT_STAGES: list[Stage] = [ ... ]
 1. **block** — 아래 중 하나라도 참이면:
    - `ctx.blocked == True` (근거는 `ctx.block_reason` 를 `guardrail_hits` 에 첨부)
    - `ctx.injection.hit == True`
-   - `ctx.risk_score >= config.risk.hard_block` (기본 `0.8`)
+   - `ctx.risk_score >= config.risk.hard_block` (기본 `0.6`, input 경로만)
 2. **allow** — block 이 아니고, 스테이지가 `ctx.turns[*].text` 를 **바꾸지 않았으면**.
    원본 `body` 를 그대로 통과시킨다 (재직렬화하지 않는다).
 3. **transform** — block 이 아니고, `ctx.turns[*].text` 가 **바뀌었으면**.
@@ -189,19 +201,21 @@ class Decision:
 ## 9. 예시 — 스테이지 붙이기
 
 ```python
-# app/pipeline.py
-from app.detect import run as detect_run
-
-def _pii_detect(ctx: AnalysisContext) -> AnalysisContext:
-    for turn in ctx.turns:
-        ctx.new_turn_spans.extend(detect_run(turn.text))
+# app/detect/__init__.py — 스테이지 함수를 모듈이 직접 제공한다
+def detect(text: str) -> list[Span]: ...           # 레이어 실행 + 병합
+def pii_detect_stage(ctx: AnalysisContext) -> AnalysisContext:
+    ctx.new_turn_spans = detect(ctx.turns[-1].text)  # 마지막 턴만
     return ctx
 
+# app/pipeline.py
+from app.detect import pii_detect_stage
 _INPUT_STAGES: list[Stage] = [
-    _pii_detect,   # [3] 자리
+    injection_guard,
+    pii_detect_stage,   # [3]
+    ...
 ]
 ```
 
-파이프라인이 요청마다 `_pii_detect` 를 실행하고, 그 결과(`ctx.new_turn_spans`)를 이후 스테이지
+파이프라인이 요청마다 `pii_detect_stage` 를 실행하고, 그 결과(`ctx.new_turn_spans`)를 이후 스테이지
 ([4] 멀티턴, [5] 정책)가 소비한다. block/transform/로그는 파이프라인이 처리한다.
 

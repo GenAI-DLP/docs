@@ -1,15 +1,15 @@
 # 양방향 가드레일 (Input / Output)
 
-> **구현 상태.** Input Guard `guardrail/injection.py` 는 구현·배선됨(dlp-server #13, 입력
-> 파이프라인 [2]). Output Guard `guardrail/output_check.py` 는 예정 — 기능 f·g 및 detokenize
-> 경로가 준비된 뒤 착수(§7). 이 문서는 완성 기준 계약이며, Input 은 구현 반영, Output 은 설계 개요다.
+> **구현 상태.** Input Guard `guardrail/injection.py`(입력 [2]) · Output Guard
+> `guardrail/output_check.py`(출력 [1], detokenize 앞) 모두 구현·배선됨. 둘 다 규칙 기반이고
+> 모델 백엔드는 seam 만 있다. eval 데이터셋 기반 임계값 튜닝(Phase 6)이 남았다.
 
 **우선순위:** 필수
 **한 줄 정의:** LLM 요청(인젝션·탈옥·반출 시도)과 응답(타인 PII 재생성·인젝션 순응·정책 위반)을 규칙 기반으로 검사하고, 적중 시 파이프라인이 `block`(또는 재마스킹)한다.
 **담당 모듈:** `guardrail/injection.py`(Input Guard), `guardrail/output_check.py`(Output Guard — 탐지 엔진은 기능 b 재사용)
 
 설계 의도·전체 맥락: [`../../architecture/dlp-server-architecture.md`](../../architecture/dlp-server-architecture.md) §6-c, §3.1 / §3.2
-파이프라인 계약: [`pipeline-stage-contract.md`](pipeline-stage-contract.md) §4 (입력 [2] / 출력 [3]), §5 (block 신호 채널)
+파이프라인 계약: [`pipeline-stage-contract.md`](pipeline-stage-contract.md) §4 (입력 [2] / 출력 [1], detokenize 앞), §5 (block 신호 채널)
 관련 스키마: [`../../schemas/dlp-server/log-event.md`](../../schemas/dlp-server/log-event.md) (`guardrail_hits`)
 색인: [`../spec-index.md`](../spec-index.md)
 
@@ -116,17 +116,48 @@ InjectionVerdict(hit=True, score=0.9, pattern="instruction_override.ignore_prior
 | fail-open | `scan` 내부 오류 → `hit=False` |
 | 파이프라인 통합 | 인젝션 body → `analyze()` → `action="block"`, `guardrail_hits[0].type == "injection"`; 정상 body → `allow` |
 
-## 7. Output Guard (예정)
+## 7. Output Guard
 
-`guardrail/output_check.py`, 출력 파이프라인 [3] 스테이지. 기능 f·g 및 detokenize 경로가
-준비된 뒤 착수한다. 탐지 엔진은 기능 b 를 재사용하되 임계값은 방향별로 별도로 둔다.
+`guardrail/output_check.py` 의 `output_guard(ctx)` — **출력 파이프라인 [1] 스테이지, `detokenize_stage`
+앞.** `direction != "output"` 이거나 assistant 턴이 없으면 무동작. 오류는 **fail-closed(block)** —
+출력이 마지막 방어선이라 Input Guard(fail-open)와 방향이 반대다.
 
-검사 3종:
+### 7.1 검사 순서
 
-1. **타인 PII 재생성** — 모델 응답에 요청에 없던 PII 가 새로 등장(환각 포함). 재마스킹 또는 `block`.
-2. **인젝션 순응 여부** — 요청이 통과했더라도 응답이 시스템 프롬프트 노출·역할 이탈을 보이는지.
-3. **정책 위반·기밀 유출 패턴** — 내부 문서 서명, 비밀키 형태 등.
+1. **타인 PII 재스캔·재마스킹** (`_rescan_and_mask`) — `detect/regex_rules.detect(text)` 로 응답의
+   정형 PII 를 찾아 `confidence >= output_pii_min_confidence`(기본 0.5)인 span 을 `start` **역순**으로
+   `apply.py::mask_preview` 규칙으로 마스킹한다.
+   - detokenize **앞**이라 토큰 라벨 `<PII:…>` 은 정규식에 안 걸린다 → 여기 잡히는 건 모델이 새로
+     만든 PII 뿐. 복원된 인가 PII 를 다시 가리는 사고를 막는다.
+   - 현재 `regex_rules` 만 사용. 사전(내부 임직원명 등)·NER 은 기능 b 오케스트레이터 편입 후 `detect.detect` 로 교체.
+2. **인젝션 순응 탐지** (`_injection_compliance`) — `output_injection_check`(기본 `true`)면, 응답이
+   시스템 프롬프트·내부 지시를 노출하는 패턴인지 검사한다. 규칙 4개(모듈 상수 `_RAW_OUTPUT_RULES`):
+   `system_prompt_leak.ko` / `system_prompt_leak.en` / `instruction_disclosure.en` / `role_disclosure.ko`.
+   입력측 규칙(`injection.py` = "이전 지시 무시" *요구*)과 방향이 반대라 공유하지 않는다.
+   적중 시 `ctx.blocked = True`, `ctx.block_reason = {"type": "output_guard", "note":
+   "injection_compliance", "pattern": "<규칙 이름>"}`.
 
-block 신호는 `ctx.blocked` + `ctx.block_reason={"type": "output_*", …}` 로 낸다
-(Input Guard 의 `injection.hit` 채널과 구분 — [`pipeline-stage-contract.md`](pipeline-stage-contract.md) §5).
-상세 규칙·임계값은 구현 시 이 절을 채운다.
+> **미구현:** 원 설계의 "정책 위반·기밀 유출 패턴(내부 문서 서명, 비밀키 형태 등)"은 아직 없다.
+> red-team eval(Phase 6) 후 `_RAW_OUTPUT_RULES` 에 추가한다.
+
+### 7.2 판정
+
+- 재마스킹으로 텍스트가 바뀌면 파이프라인이 `transform` + `rebuild_response`. 안 바뀌면 `allow`.
+- 인젝션 순응·stage_error 는 `block`. block 신호는 `ctx.blocked` + `ctx.block_reason={"type":
+  "output_guard", …}` (Input Guard 의 `injection.hit` 채널과 구분 —
+  [`pipeline-stage-contract.md`](pipeline-stage-contract.md) §5).
+- fail-closed: 스테이지 내부 예외 → `ctx.blocked = True`, `block_reason = {"type": "output_guard",
+  "note": "stage_error"}`.
+
+### 7.3 설정값
+
+| 키 | 기본 | 의미 |
+|---|---|---|
+| `DLP_GUARDRAIL__OUTPUT_PII_MIN_CONFIDENCE` (`config.guardrail.output_pii_min_confidence`) | `0.5` | 재스캔 span 을 재마스킹할 최소 confidence |
+| `DLP_GUARDRAIL__OUTPUT_INJECTION_CHECK` (`config.guardrail.output_injection_check`) | `true` | 인젝션 순응 검사 on/off |
+
+### 7.4 테스트
+
+`tests/test_output_check.py` — 재스캔·재마스킹, `<PII:…>` 라벨은 재스캔에 안 걸림, 인젝션 순응 →
+`block`, fail-closed(볼트/규칙 예외 → `stage_error`), 파이프라인 관통(`analyze(direction="output")`
+→ `transform`/`allow`/`block`).

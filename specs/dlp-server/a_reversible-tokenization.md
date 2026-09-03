@@ -1,8 +1,9 @@
 # 가역적 토큰화
 
-> **구현 상태.** 볼트 레포지토리 `transform/vault.py` 는 구현·머지됨(dlp-server #12).
-> 파이프라인 배선(입력 [6] 토큰화 / 출력 [2] detokenize)은 후속 — 기능 g·c-output 이 스테이지로
-> 연결한다. 이 문서는 완성 기준 계약을 서술한다.
+> **구현 상태.** 볼트 레포지토리 `transform/vault.py`(#12) + 파이프라인 배선 모두 완료.
+> 입력 [6] 토큰화는 `transform/apply.py::_tokenize`(기능 g), 출력 [2] detokenize 는
+> `transform/apply.py::detokenize_stage`(`_OUTPUT_STAGES` 에 배선). `session_id` 는 저장 시
+> `app/ids.py::coerce_session_uuid` 로 결정론적 UUID 로 매핑한다.
 
 **우선순위:** 필수
 **한 줄 정의:** 외부 LLM 전송 전 PII를 결정론적 토큰으로 치환하고, 응답 수신 후 인가된 요청자에 한해 원본으로 복원한다.
