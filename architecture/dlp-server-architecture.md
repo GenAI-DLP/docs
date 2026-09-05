@@ -163,7 +163,7 @@ dlp-server/
 │   ├── proto/                    # protoc 생성물 (빌드 시 생성, VCS 제외)
 │   │
 │   ├── grpc_server.py            # 얇은 어댑터: proto ↔ 내부 타입 변환 + pipeline.analyze() 호출 + 예외 처리
-│   ├── api.py                    # 얇은 어댑터: /health, /events(대시보드), 평가 스크립트 진입점
+│   ├── api.py                    # 얇은 어댑터: /health, /events·/events/stream(대시보드), 평가 스크립트 진입점
 │   │
 │   ├── pipeline.py               # [핵심] analyze() 단일 진입점 — gRPC · HTTP · 평가 스크립트가 모두 재사용
 │   ├── models.py                 # [핵심] 계약 타입 (Turn / Span / AnalysisContext / Decision) + WIRE/TRANSFORM_ACTIONS 상수
@@ -208,7 +208,8 @@ dlp-server/
 │   │   └── sequence_analyzer.py  # tool call 시퀀스 이상행동 탐지 (스켈레톤)
 │   │
 │   └── logging/
-│       └── events.py             # 구조화 감사 로그 — 모든 스테이지 판정이 수렴. PostgreSQL log_events sink
+│       ├── events.py             # 구조화 감사 로그 — 모든 스테이지 판정이 수렴. PostgreSQL log_events sink
+│       └── bus.py                # in-process pub/sub — write_pg() 직후 이벤트를 broadcast, /events/stream(SSE)이 구독
 │
 ├── eval/
 │   ├── run_eval.py               # baseline(정규식 즉시 차단) vs full(전체 파이프라인) 비교
@@ -531,7 +532,10 @@ aggregate/synthetic 동작. 남음: `access_scope` 정책화(`policy_rules` +res
 **상태: 🚧 진행 중** — PostgreSQL `log_events` sink · GLiNER NER 통합·병합 편입 완료.
 `/events` 엔드포인트와 관리자 대시보드는 데모 0 에서 착수.
 구조화 감사 로그를 PostgreSQL `log_events` 로 정착(스테이지 판정 수렴), `/events` 엔드포인트
-(대시보드 tail), 한국어 NER 통합 및 병합 편입, 임계값 튜닝.
+(대시보드 tail), 한국어 NER 통합 및 병합 편입, 임계값 튜닝. 이후 `/events/stream`(SSE)을 추가해
+대시보드 이벤트 피드를 폴링 대신 판정 즉시 push로 전환 — `write_pg()` 직후 in-process
+pub/sub(`logging/bus.py`)로 broadcast하는 방식이며, 다중 프로세스로 확장할 때는 Kafka/Redis
+Streams 같은 외부 브로커로 대체 가능.
 **검증:** 대시보드에 세션별 탐지·목적·조치·지연이 실시간 표시되고 원문이 노출되지 않음.
 
 ### Phase 6 — 성능 평가 + 레드팀

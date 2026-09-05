@@ -12,7 +12,7 @@
 | **dlp-proxy-server** | `dlp-proxy-server` | Go | 직원 PC ↔ 외부 LLM 트래픽을 SNI allowlist로 거르고, 대상만 TLS 종단(MITM). HTTP 파싱 후 gRPC로 판정 요청, 판정대로 외부 LLM에 중계 |
 | **dlp-server** | `dlp-server` | Python / FastAPI | 의미 기반 검사 백엔드. Input/Output Guard, 멀티턴 분석, PII 탐지, 목적·정책, 동적 변환·토큰화 |
 | **dlp-proto** | 공유 소스 (서브모듈) | protobuf | 위 둘 사이의 gRPC 계약. 양쪽이 공유, 임의 변경 금지 |
-| 대시보드 | (별도) | Streamlit | 감사 로그를 tail 해 탐지·차단 현황 표시 |
+| 대시보드 | `dashboard` | React | 감사 로그를 조회(`/events`)·실시간 tail(`/events/stream` SSE)해 탐지·차단 현황 표시 |
 
 ---
 
