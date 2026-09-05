@@ -48,12 +48,13 @@ DDL 원본: [`postgres-schema.sql`](postgres-schema.sql) §4
 
 ## 대시보드 · eval 소비
 
-- 대시보드(Streamlit)는 `api.py` 의 `/events` 로 최근 로그를 tail 하고, 세션별 탐지·목적·조치·지연을
-  표시한다(원문 미노출).
+- 대시보드(React)는 `api.py` 의 `/events` 로 최근 로그를 조회하고, `/events/stream`(SSE)으로
+  판정 즉시 push되는 라이브 tail을 받는다. 세션별 탐지·목적·조치·지연을 표시한다(원문 미노출).
 - `eval/run_eval.py` 는 baseline vs full 두 모드의 로그를 모아 Detection Rate / FPR / latency 를 계산.
 
 ## 데모 구현
 
 `logging/events.py` — `LogEvent` 구조화 후 **PostgreSQL `log_events` INSERT** sink. 컬럼 의미는
-위와 동일. `/events` 는 이 테이블을 최신순으로 조회한다. append-only 파티셔닝·검색엔진
-(Elasticsearch 등) 이관은 확장.
+위와 동일. `/events` 는 이 테이블을 최신순으로 조회한다. INSERT 성공 시 같은 이벤트를
+`logging/bus.py`의 in-process pub/sub으로도 broadcast해 `/events/stream`(SSE)이 구독한다 —
+응답 셰이프는 `/events`와 동일. append-only 파티셔닝·검색엔진(Elasticsearch 등) 이관은 확장.
